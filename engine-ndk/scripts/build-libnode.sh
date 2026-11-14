@@ -21,13 +21,13 @@ resolve_ndk() {
         echo "$ANDROID_NDK_HOME"
         return 0
     fi
-    if [[ -n "${ANDROID_NDK_LATEST_HOME:-}" && -d "${ANDROID_NDK_LATEST_HOME}" ]]; then
-        echo "$ANDROID_NDK_LATEST_HOME"
-        return 0
-    fi
     local sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
     if [[ -n "$sdk_root" && -d "$sdk_root/ndk/27.2.12479018" ]]; then
         echo "$sdk_root/ndk/27.2.12479018"
+        return 0
+    fi
+    if [[ -n "${ANDROID_NDK_LATEST_HOME:-}" && -d "${ANDROID_NDK_LATEST_HOME}" ]]; then
+        echo "$ANDROID_NDK_LATEST_HOME"
         return 0
     fi
     if [[ -n "$sdk_root" && -d "$sdk_root/ndk" ]]; then
@@ -104,14 +104,20 @@ EOF
 "$CXX_TARGET" $TARGET_CXXFLAGS -std=gnu++17 -shared -Wl,-soname,libprobe.so \
     "$PROBE_DIR/probe.cc" $TARGET_LDFLAGS -o "$PROBE_DIR/libprobe.so"
 
-if ! "$READELF_TARGET" -d "$PROBE_DIR/libprobe.so" | grep -q "libc++_shared\.so"; then
+PROBE_DYN="$("$READELF_TARGET" -d "$PROBE_DIR/libprobe.so")"
+if ! grep -q "libc++_shared\.so" <<<"$PROBE_DYN"; then
     echo "ERROR: Preflight failed — target shared library did not link libc++_shared.so" >&2
-    "$READELF_TARGET" -d "$PROBE_DIR/libprobe.so" >&2
+    echo "$PROBE_DYN" >&2
     exit 1
 fi
-if ! "$READELF_TARGET" -l "$PROBE_DIR/libprobe.so" | grep -qE "0x4000|0x10000"; then
+PROBE_SEG="$("$READELF_TARGET" -l "$PROBE_DIR/libprobe.so")"
+if ! python3 -c '
+import sys
+loads = [l.split()[-1] for l in sys.stdin.read().splitlines() if l.strip().startswith("LOAD ")]
+assert loads and all(int(a, 16) >= 0x4000 for a in loads), f"Bad LOAD alignments: {loads}"
+' <<<"$PROBE_SEG"; then
     echo "ERROR: Preflight failed — ELF PT_LOAD alignment is below 16 KB (0x4000)" >&2
-    "$READELF_TARGET" -l "$PROBE_DIR/libprobe.so" >&2
+    echo "$PROBE_SEG" >&2
     exit 1
 fi
 log "Preflight check PASSED (libc++_shared.so + 16KB ELF alignment verified)."
@@ -241,17 +247,23 @@ log "Installing Node/V8/libuv/OpenSSL headers into staging dir..."
 python3 tools/install.py install --headers-only --dest-dir "$STAGE_DIR" --prefix /
 
 log "Verifying built libnode.so ELF headers (SONAME, libc++_shared, 16KB page align)..."
-"$READELF_TARGET" -d "$STAGE_DIR/lib/arm64-v8a/libnode.so" | grep -E "SONAME|NEEDED"
-if ! "$READELF_TARGET" -d "$STAGE_DIR/lib/arm64-v8a/libnode.so" | grep -q "SONAME.*\[libnode\.so\]"; then
+NODE_DYN="$("$READELF_TARGET" -d "$STAGE_DIR/lib/arm64-v8a/libnode.so")"
+grep -E "SONAME|NEEDED" <<<"$NODE_DYN" || true
+if ! grep -q "SONAME.*\[libnode\.so\]" <<<"$NODE_DYN"; then
     echo "ERROR: libnode.so SONAME must be unversioned libnode.so" >&2
     exit 1
 fi
-if ! "$READELF_TARGET" -d "$STAGE_DIR/lib/arm64-v8a/libnode.so" | grep -q "libc++_shared\.so"; then
+if ! grep -q "libc++_shared\.so" <<<"$NODE_DYN"; then
     echo "ERROR: libnode.so must dynamically depend on libc++_shared.so" >&2
     exit 1
 fi
-"$READELF_TARGET" -l "$STAGE_DIR/lib/arm64-v8a/libnode.so" | grep -A1 "LOAD"
-if ! "$READELF_TARGET" -l "$STAGE_DIR/lib/arm64-v8a/libnode.so" | grep -qE "0x4000|0x10000"; then
+NODE_SEG="$("$READELF_TARGET" -l "$STAGE_DIR/lib/arm64-v8a/libnode.so")"
+grep -E "LOAD|Align" <<<"$NODE_SEG" || true
+if ! python3 -c '
+import sys
+loads = [l.split()[-1] for l in sys.stdin.read().splitlines() if l.strip().startswith("LOAD ")]
+assert loads and all(int(a, 16) >= 0x4000 for a in loads), f"Bad LOAD alignments: {loads}"
+' <<<"$NODE_SEG"; then
     echo "ERROR: libnode.so ELF PT_LOAD alignment is below 16 KB (0x4000)" >&2
     exit 1
 fi

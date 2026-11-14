@@ -266,10 +266,11 @@ jobs:
           )
 
           echo "=== APK Native & Asset Entries ==="
-          unzip -l "${FINAL_APK}" | grep -E "assets/st_app|lib/arm64-v8a/"
+          APK_ENTRIES="$(unzip -Z1 "${FINAL_APK}")"
+          grep -E "^(assets/st_app|lib/arm64-v8a/)" <<<"${APK_ENTRIES}"
 
           for required in "assets/st_app.zip" "assets/st_app.sha256" "lib/arm64-v8a/libnode.so" "lib/arm64-v8a/libst_bridge.so" "lib/arm64-v8a/libc++_shared.so"; do
-            if ! unzip -Z1 "${FINAL_APK}" | grep -qx "${required}"; then
+            if ! grep -qx "${required}" <<<"${APK_ENTRIES}"; then
               echo "ERROR: Missing required APK entry: ${required}" >&2
               exit 1
             fi
