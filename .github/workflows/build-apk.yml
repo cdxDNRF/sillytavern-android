@@ -84,7 +84,7 @@ jobs:
 
   prepare-node-engine:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 240
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -98,7 +98,7 @@ jobs:
           set -euo pipefail
           OUT_DIR="${{ runner.temp }}/engine-out"
           mkdir -p "${OUT_DIR}"
-          ENGINE_TAG="engine-node-${NODE_VERSION}"
+          ENGINE_TAG="engine-node-${NODE_VERSION}-r2"
 
           DOWNLOADED=false
           if [[ "${REBUILD_ENGINE}" != "true" ]] && gh release view "${ENGINE_TAG}" >/dev/null 2>&1; then
@@ -276,9 +276,82 @@ jobs:
             fi
           done
 
-          echo "=== Verifying 16KB ZIP alignment & APK Signature ==="
+          echo "=== Verifying 16KB ZIP alignment, native ELF alignment/symbols, & APK Signature ==="
           "${ANDROID_HOME}/build-tools/35.0.0/zipalign" -c -P 16 -v 4 "${FINAL_APK}" | tail -n 15
           "${ANDROID_HOME}/build-tools/35.0.0/apksigner" verify --verbose --print-certs "${FINAL_APK}"
+
+          SO_AUDIT_DIR="${{ runner.temp }}/apk-so-audit"
+          rm -rf "${SO_AUDIT_DIR}"
+          mkdir -p "${SO_AUDIT_DIR}"
+          unzip -q -o "${FINAL_APK}" "lib/arm64-v8a/*.so" -d "${SO_AUDIT_DIR}"
+
+          NDK_TOOLCHAIN="${ANDROID_HOME}/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64"
+          READELF_BIN="${NDK_TOOLCHAIN}/bin/llvm-readelf"
+          SYSROOT_API_LIB="${NDK_TOOLCHAIN}/sysroot/usr/lib/aarch64-linux-android/29"
+          python3 - "${READELF_BIN}" "${SO_AUDIT_DIR}/lib/arm64-v8a" "${SYSROOT_API_LIB}" <<'PY'
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          readelf, lib_dir_str, sysroot_api_lib = sys.argv[1:]
+          lib_dir = pathlib.Path(lib_dir_str)
+          sysroot_dir = pathlib.Path(sysroot_api_lib)
+
+          def run_readelf(args):
+              return subprocess.check_output([readelf, *args], text=True)
+
+          so_files = sorted(lib_dir.glob("*.so"))
+          assert so_files, f"No .so files extracted under {lib_dir}"
+
+          for so_path in so_files:
+              seg_out = run_readelf(["-l", str(so_path)])
+              loads = [l.split()[-1] for l in seg_out.splitlines() if l.strip().startswith("LOAD ")]
+              assert loads and all(int(a, 16) >= 0x4000 for a in loads), (
+                  f"16KB ELF PT_LOAD check failed for {so_path.name}: {loads}"
+              )
+              print(f"ELF 16KB PT_LOAD OK: {so_path.name} -> {loads}")
+
+          for target_name in ("libnode.so", "libst_bridge.so"):
+              target_path = lib_dir / target_name
+              dyn_out = run_readelf(["-d", str(target_path)])
+              needed = re.findall(r"\(NEEDED\)\s+Shared library:\s+\[([^\]]+)\]", dyn_out)
+              print(f"{target_name} DT_NEEDED: {needed}")
+
+              available_defs = set()
+              for dep in needed:
+                  dep_path = (lib_dir / dep) if (lib_dir / dep).is_file() else (sysroot_dir / dep)
+                  if not dep_path.is_file():
+                      raise SystemExit(f"Missing DT_NEEDED library for {target_name}: {dep}")
+                  dep_syms = run_readelf(["--dyn-syms", "-W", str(dep_path)])
+                  for line in dep_syms.splitlines():
+                      parts = line.split()
+                      if len(parts) >= 8 and parts[0].endswith(":") and parts[6] != "UND" and parts[4] in ("GLOBAL", "WEAK", "UNIQUE"):
+                          available_defs.add(parts[7].split("@")[0])
+
+              target_syms = run_readelf(["--dyn-syms", "-W", str(target_path)])
+              unresolved = []
+              for line in target_syms.splitlines():
+                  parts = line.split()
+                  if len(parts) < 8 or not parts[0].endswith(":") or parts[6] != "UND":
+                      continue
+                  bind = parts[4]
+                  raw_name = parts[7]
+                  base_name = raw_name.split("@")[0]
+                  if base_name == "android_getCpuFeatures":
+                      raise SystemExit(f"Forbidden unresolved android_getCpuFeatures in {target_name}: {line}")
+                  if bind == "WEAK":
+                      continue
+                  if base_name not in available_defs:
+                      unresolved.append((bind, raw_name))
+
+              if unresolved:
+                  for bind, name in unresolved[:40]:
+                      print(f"ERROR: Unresolved {bind} symbol in {target_name}: {name}", file=sys.stderr)
+                  raise SystemExit(f"Unresolved GLOBAL symbols in {target_name}: {len(unresolved)}")
+
+              print(f"Dynamic symbol closure OK for {target_name} ({len(available_defs)} provider symbols indexed)")
+          PY
 
           {
             echo "## SillyTavern Android APK Build Summary"

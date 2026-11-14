@@ -79,15 +79,30 @@ for tool in "$CC_TARGET" "$CXX_TARGET" "$AR_TARGET" "$RANLIB_TARGET" "$STRIP_TAR
     fi
 done
 
+CPU_FEATURES_SRC="$NDK_HOME/sources/android/cpufeatures/cpu-features.c"
+if [[ ! -f "$CPU_FEATURES_SRC" ]]; then
+    echo "ERROR: Android NDK cpufeatures source missing at $CPU_FEATURES_SRC" >&2
+    exit 1
+fi
+
+mkdir -p "$WORK_DIR" "$OUT_DIR"
+CPU_FEATURES_DIR="$WORK_DIR/cpufeatures"
+mkdir -p "$CPU_FEATURES_DIR"
+CPU_FEATURES_OBJ="$CPU_FEATURES_DIR/cpu-features.o"
+
 TARGET_CFLAGS="-fPIC -g0 -pipe"
 TARGET_CXXFLAGS="-fPIC -g0 -pipe"
-TARGET_LDFLAGS="-nostdlib++ -lc++_shared -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384"
+
+log "Compiling NDK android_getCpuFeatures object ($CPU_FEATURES_SRC)..."
+"$CC_TARGET" $TARGET_CFLAGS -fvisibility=hidden -I"$NDK_HOME/sources/android/cpufeatures" \
+    -c "$CPU_FEATURES_SRC" -o "$CPU_FEATURES_OBJ"
+
+TARGET_LDFLAGS="-nostdlib++ -lc++_shared -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 $CPU_FEATURES_OBJ"
 
 log "Using NDK: $NDK_HOME (API $ANDROID_API, NODE $NODE_VERSION, intl=$INTL_MODE)"
 
-# Fast preflight check: verify C++ shared STL linkage and 16KB ELF segment alignment
+# Fast preflight check: verify C++ shared STL linkage, cpu-features.o linkage, and 16KB ELF segment alignment
 # before investing build time in Node/V8.
-mkdir -p "$WORK_DIR" "$OUT_DIR"
 PROBE_DIR="$WORK_DIR/preflight"
 rm -rf "$PROBE_DIR"
 mkdir -p "$PROBE_DIR"
@@ -95,19 +110,24 @@ cat > "$PROBE_DIR/probe.cc" <<'EOF'
 #include <memory>
 #include <string>
 #include <vector>
+#include <cpu-features.h>
 extern "C" int st_ndk_probe(void) {
     auto v = std::make_shared<std::vector<std::string>>();
     v->emplace_back("sillytavern-android");
-    return static_cast<int>(v->size());
+    return static_cast<int>(v->size()) + (android_getCpuFeatures() != 0 ? 1 : 0);
 }
 EOF
-"$CXX_TARGET" $TARGET_CXXFLAGS -std=gnu++17 -shared -Wl,-soname,libprobe.so \
+"$CXX_TARGET" $TARGET_CXXFLAGS -I"$NDK_HOME/sources/android/cpufeatures" -std=gnu++17 -shared -Wl,-soname,libprobe.so \
     "$PROBE_DIR/probe.cc" $TARGET_LDFLAGS -o "$PROBE_DIR/libprobe.so"
 
 PROBE_DYN="$("$READELF_TARGET" -d "$PROBE_DIR/libprobe.so")"
 if ! grep -q "libc++_shared\.so" <<<"$PROBE_DYN"; then
     echo "ERROR: Preflight failed — target shared library did not link libc++_shared.so" >&2
     echo "$PROBE_DYN" >&2
+    exit 1
+fi
+if "$READELF_TARGET" --dyn-syms -W "$PROBE_DIR/libprobe.so" | grep -q "UND.*android_getCpuFeatures"; then
+    echo "ERROR: Preflight failed — android_getCpuFeatures remained unresolved" >&2
     exit 1
 fi
 PROBE_SEG="$("$READELF_TARGET" -l "$PROBE_DIR/libprobe.so")"
@@ -120,7 +140,7 @@ assert loads and all(int(a, 16) >= 0x4000 for a in loads), f"Bad LOAD alignments
     echo "$PROBE_SEG" >&2
     exit 1
 fi
-log "Preflight check PASSED (libc++_shared.so + 16KB ELF alignment verified)."
+log "Preflight check PASSED (libc++_shared.so + android_getCpuFeatures + 16KB ELF alignment verified)."
 
 SRC_ARCHIVE="$WORK_DIR/node-${NODE_VERSION}.tar.xz"
 SHASUMS_FILE="$WORK_DIR/SHASUMS256.txt"
@@ -267,6 +287,61 @@ assert loads and all(int(a, 16) >= 0x4000 for a in loads), f"Bad LOAD alignments
     echo "ERROR: libnode.so ELF PT_LOAD alignment is below 16 KB (0x4000)" >&2
     exit 1
 fi
+
+log "Auditing libnode.so dynamic symbols against NDK API-$ANDROID_API sysroot & libc++_shared.so..."
+SYSROOT_API_LIB="$TOOLCHAIN/sysroot/usr/lib/aarch64-linux-android/${ANDROID_API}"
+python3 - "$READELF_TARGET" "$STAGE_DIR/lib/arm64-v8a/libnode.so" "$STAGE_DIR/lib/arm64-v8a/libc++_shared.so" "$SYSROOT_API_LIB" <<'PY'
+import pathlib
+import re
+import subprocess
+import sys
+
+readelf, node_so, libcxx_so, sysroot_api_lib = sys.argv[1:]
+
+def run_readelf(args):
+    return subprocess.check_output([readelf, *args], text=True)
+
+dyn_out = run_readelf(["-d", node_so])
+needed = re.findall(r"\(NEEDED\)\s+Shared library:\s+\[([^\]]+)\]", dyn_out)
+print(f"[build-libnode] DT_NEEDED: {needed}")
+
+available_defs = set()
+for lib_name in needed:
+    if lib_name == "libc++_shared.so":
+        candidate = pathlib.Path(libcxx_so)
+    else:
+        candidate = pathlib.Path(sysroot_api_lib) / lib_name
+    if not candidate.is_file():
+        raise SystemExit(f"ERROR: DT_NEEDED library '{lib_name}' not found at {candidate}")
+    syms_out = run_readelf(["--dyn-syms", "-W", str(candidate)])
+    for line in syms_out.splitlines():
+        parts = line.split()
+        if len(parts) >= 8 and parts[6] != "UND" and parts[4] in ("GLOBAL", "WEAK", "UNIQUE"):
+            available_defs.add(parts[7].split("@")[0])
+
+node_syms_out = run_readelf(["--dyn-syms", "-W", node_so])
+unresolved = []
+for line in node_syms_out.splitlines():
+    parts = line.split()
+    if len(parts) < 8 or parts[6] != "UND":
+        continue
+    bind = parts[4]
+    raw_name = parts[7]
+    base_name = raw_name.split("@")[0]
+    if base_name == "android_getCpuFeatures":
+        raise SystemExit(f"ERROR: Forbidden unresolved android_getCpuFeatures in libnode.so: {line}")
+    if bind == "WEAK":
+        continue
+    if base_name not in available_defs:
+        unresolved.append((bind, raw_name))
+
+if unresolved:
+    for bind, name in unresolved[:40]:
+        print(f"ERROR: Unresolved {bind} UND symbol in libnode.so: {name}", file=sys.stderr)
+    raise SystemExit(f"ERROR: Found {len(unresolved)} unresolved GLOBAL UND symbols in libnode.so")
+
+print("[build-libnode] Dynamic symbol audit PASSED (zero unresolved GLOBAL symbols).")
+PY
 
 cat > "$STAGE_DIR/BUILD_INFO.txt" <<EOF
 node_version=$NODE_VERSION

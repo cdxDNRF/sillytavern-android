@@ -36,8 +36,7 @@
         <service
             android:name=".engine.TavernEngineService"
             android:exported="false"
-            android:foregroundServiceType="specialUse"
-            android:process=":engine">
+            android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Runs embedded local SillyTavern Node.js AI chat backend service strictly inside app-private storage." />

@@ -36,6 +36,10 @@ class TavernEngineService : Service() {
     private val callbacks = RemoteCallbackList<ITavernEngineCallback>()
     private val engineStartingOrRunning = AtomicBoolean(false)
     private val restartPending = AtomicBoolean(false)
+    private val nativeLibraryLoaded = AtomicBoolean(false)
+
+    private val serviceLogLock = Any()
+    private val serviceLogs = ArrayDeque<String>()
 
     @Volatile
     private var currentState: Int = EngineState.IDLE
@@ -98,10 +102,26 @@ class TavernEngineService : Service() {
         override fun getLastError(): String = lastError
 
         override fun getRecentLogs(): String {
-            return try {
-                NativeNodeEngine.nativeGetRecentLogs()
-            } catch (t: Throwable) {
-                "Unable to fetch native logs: ${t.message}"
+            val kotlinLogs = synchronized(serviceLogLock) {
+                serviceLogs.joinToString("\n")
+            }
+            val nativeLogs = if (nativeLibraryLoaded.get()) {
+                try {
+                    NativeNodeEngine.nativeGetRecentLogs()
+                } catch (t: Throwable) {
+                    "Unable to fetch native logs: ${t.message}"
+                }
+            } else {
+                ""
+            }
+            return buildString {
+                if (kotlinLogs.isNotBlank()) {
+                    append(kotlinLogs)
+                }
+                if (nativeLogs.isNotBlank()) {
+                    if (isNotEmpty()) append("\n--- Node.js Runtime Logs ---\n")
+                    append(nativeLogs)
+                }
             }
         }
 
@@ -110,12 +130,16 @@ class TavernEngineService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
-        installedAssetVersion = AssetExtractor.readInstalledSha(this)
+        appendServiceLog("TavernEngineService.onCreate (pid=${android.os.Process.myPid()})")
+        runCatching { createNotificationChannel() }
+            .onFailure { appendServiceLog("createNotificationChannel warning: ${it.message}") }
+        installedAssetVersion = runCatching { AssetExtractor.readInstalledSha(this) }.getOrDefault("")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
+        val action = intent?.action
+        appendServiceLog("onStartCommand action=${action ?: "<null>"}")
+        when (action) {
             ACTION_STOP -> {
                 restartPending.set(false)
                 shutdownEngine(stopSelfAfter = true)
@@ -134,14 +158,29 @@ class TavernEngineService : Service() {
         }
     }
 
-    override fun onBind(intent: Intent?): IBinder = binder
+    override fun onBind(intent: Intent?): IBinder {
+        appendServiceLog("TavernEngineService.onBind")
+        return binder
+    }
 
     override fun onDestroy() {
+        appendServiceLog("TavernEngineService.onDestroy")
         restartPending.set(false)
         shutdownEngine(stopSelfAfter = false)
         engineExecutor.shutdown()
         callbacks.kill()
         super.onDestroy()
+    }
+
+    private fun appendServiceLog(msg: String) {
+        Log.i(TAG, msg)
+        val stamped = "[Service] $msg"
+        synchronized(serviceLogLock) {
+            serviceLogs.addLast(stamped)
+            while (serviceLogs.size > 150) {
+                serviceLogs.removeFirst()
+            }
+        }
     }
 
     private fun generateSessionToken(): String {
@@ -151,17 +190,25 @@ class TavernEngineService : Service() {
     }
 
     private fun promoteForeground(statusText: String) {
-        val notification = buildNotification(statusText)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else {
-            startForeground(NOTIF_ID, notification)
+        runCatching {
+            val notification = buildNotification(statusText)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(NOTIF_ID, notification)
+            }
+        }.onFailure { t ->
+            appendServiceLog("promoteForeground skipped (${t.javaClass.simpleName}): ${t.message}")
         }
     }
 
     private fun updateNotification(statusText: String) {
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.notify(NOTIF_ID, buildNotification(statusText))
+        runCatching {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+            nm.notify(NOTIF_ID, buildNotification(statusText))
+        }.onFailure { t ->
+            Log.w(TAG, "updateNotification failed: ${t.message}")
+        }
     }
 
     private fun buildNotification(statusText: String): Notification {
@@ -211,31 +258,37 @@ class TavernEngineService : Service() {
 
     private fun acquirePowerLocks() {
         if (wakeLock == null) {
-            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SillyTavern:EngineWakeLock").apply {
-                setReferenceCounted(false)
-                acquire(6L * 60L * 60L * 1000L)
+            runCatching {
+                val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return@runCatching
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SillyTavern:EngineWakeLock").apply {
+                    setReferenceCounted(false)
+                    acquire(6L * 60L * 60L * 1000L)
+                }
+            }.onFailure { t ->
+                appendServiceLog("WakeLock acquisition skipped: ${t.message}")
             }
         }
         if (wifiLock == null) {
-            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "SillyTavern:EngineWifiLock").apply {
-                setReferenceCounted(false)
-                acquire()
+            runCatching {
+                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return@runCatching
+                wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "SillyTavern:EngineWifiLock").apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+            }.onFailure { t ->
+                appendServiceLog("WifiLock acquisition skipped: ${t.message}")
             }
         }
     }
 
     private fun releasePowerLocks() {
-        try {
+        runCatching {
             if (wakeLock?.isHeld == true) wakeLock?.release()
-        } catch (_: Exception) {
         }
         wakeLock = null
 
-        try {
+        runCatching {
             if (wifiLock?.isHeld == true) wifiLock?.release()
-        } catch (_: Exception) {
         }
         wifiLock = null
     }
@@ -262,82 +315,97 @@ class TavernEngineService : Service() {
 
     private fun ensureEngineStarted() {
         if (!engineStartingOrRunning.compareAndSet(false, true)) {
+            appendServiceLog("ensureEngineStarted ignored: already starting/running (state=$currentState)")
             return
         }
 
-        if (sessionToken.isEmpty()) {
-            sessionToken = generateSessionToken()
-        }
-        boundPort = 0
-        boundUrl = ""
-        lastError = ""
-        promoteForeground("正在准备 SillyTavern 运行环境...")
-        acquirePowerLocks()
+        try {
+            if (sessionToken.isEmpty()) {
+                sessionToken = generateSessionToken()
+            }
+            boundPort = 0
+            boundUrl = ""
+            lastError = ""
+            publishState(EngineState.EXTRACTING, 0, "", "正在检查并准备本地运行环境...")
+            promoteForeground("正在准备 SillyTavern 运行环境...")
+            acquirePowerLocks()
 
-        // Run Node/V8 with a generous 8 MB native stack for deep JS/WASM execution on arm64.
-        engineExecutor.execute {
-            try {
-                publishState(EngineState.EXTRACTING, 0, "", "正在检查并准备本地运行环境...")
-                val prepared = AssetExtractor.ensurePrepared(applicationContext) { progress ->
-                    publishState(EngineState.EXTRACTING, 0, "", progress)
-                    updateNotification(progress)
-                }
-                installedAssetVersion = prepared.assetHash
+            // Run Node/V8 with a generous 8 MB native stack for deep JS/WASM execution on arm64.
+            engineExecutor.execute {
+                try {
+                    appendServiceLog("Ensuring SillyTavern assets prepared in app filesDir...")
+                    val prepared = AssetExtractor.ensurePrepared(applicationContext) { progress ->
+                        publishState(EngineState.EXTRACTING, 0, "", progress)
+                        updateNotification(progress)
+                    }
+                    installedAssetVersion = prepared.assetHash
+                    appendServiceLog("Assets prepared (sha=${prepared.assetHash.take(12)}, appDir=${prepared.appDir.absolutePath})")
 
-                publishState(EngineState.STARTING, 0, "", "正在启动嵌入式 Node.js 服务...")
-                updateNotification("正在启动本地 SillyTavern 服务...")
+                    publishState(EngineState.STARTING, 0, "", "正在加载嵌入式 Node.js 运行时...")
+                    updateNotification("正在启动本地 SillyTavern 服务...")
 
-                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-                NativeNodeEngine.nativeInitDns(cm)
+                    val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                    appendServiceLog("Loading libnode.so + libst_bridge.so...")
+                    val dnsOk = NativeNodeEngine.nativeInitDns(cm)
+                    nativeLibraryLoaded.set(true)
+                    appendServiceLog("Native runtime loaded (dnsInit=$dnsOk), launching Node event loop...")
 
-                val exitCode = NativeNodeEngine.nativeStartNode(
-                    appDir = prepared.appDir.absolutePath,
-                    dataRoot = prepared.dataRoot.absolutePath,
-                    configPath = prepared.configPath.absolutePath,
-                    cacheDir = prepared.cacheDir.absolutePath,
-                    port = 0,
-                    appToken = sessionToken,
-                    callback = object : EngineLifecycleCallback {
-                        override fun onReady(port: Int, url: String) {
-                            val resolvedUrl = if (url.startsWith("http")) url else "http://127.0.0.1:$port"
-                            Log.i(TAG, "SillyTavern ready on $resolvedUrl")
-                            updateNotification("SillyTavern 本地引擎运行中（端口 $port）")
-                            publishState(EngineState.READY, port, resolvedUrl, "")
+                    publishState(EngineState.STARTING, 0, "", "正在启动嵌入式 Node.js 服务...")
+                    val exitCode = NativeNodeEngine.nativeStartNode(
+                        appDir = prepared.appDir.absolutePath,
+                        dataRoot = prepared.dataRoot.absolutePath,
+                        configPath = prepared.configPath.absolutePath,
+                        cacheDir = prepared.cacheDir.absolutePath,
+                        port = 0,
+                        appToken = sessionToken,
+                        callback = object : EngineLifecycleCallback {
+                            override fun onReady(port: Int, url: String) {
+                                val resolvedUrl = if (url.startsWith("http")) url else "http://127.0.0.1:$port"
+                                appendServiceLog("SillyTavern HTTP server ready on $resolvedUrl")
+                                updateNotification("SillyTavern 本地引擎运行中（端口 $port）")
+                                publishState(EngineState.READY, port, resolvedUrl, "")
+                            }
+
+                            override fun onError(message: String) {
+                                appendServiceLog("Node startup error callback: $message")
+                                publishState(EngineState.ERROR, 0, "", message)
+                            }
+                        },
+                    )
+
+                    appendServiceLog("Node event loop exited with code=$exitCode (state=$currentState)")
+                    if (currentState != EngineState.STOPPED && currentState != EngineState.ERROR) {
+                        if (exitCode != 0) {
+                            publishState(EngineState.ERROR, 0, "", "Node.js 引擎意外退出 (exitCode=$exitCode)")
+                        } else {
+                            publishState(EngineState.STOPPED, 0, "", "")
                         }
-
-                        override fun onError(message: String) {
-                            Log.e(TAG, "Node startup error: $message")
-                            publishState(EngineState.ERROR, 0, "", message)
-                        }
-                    },
-                )
-
-                Log.i(TAG, "Node event loop exited with code=$exitCode")
-                if (currentState != EngineState.STOPPED && currentState != EngineState.ERROR) {
-                    if (exitCode != 0) {
-                        publishState(EngineState.ERROR, 0, "", "Node.js 引擎意外退出 (exitCode=$exitCode)")
-                    } else {
-                        publishState(EngineState.STOPPED, 0, "", "")
+                    }
+                } catch (t: Throwable) {
+                    appendServiceLog("Failed inside engine thread: ${t.javaClass.name}: ${t.message}")
+                    Log.e(TAG, "Failed inside engine thread", t)
+                    publishState(EngineState.ERROR, 0, "", t.stackTraceToString())
+                } finally {
+                    engineStartingOrRunning.set(false)
+                    releasePowerLocks()
+                    if (restartPending.compareAndSet(true, false)) {
+                        sessionToken = generateSessionToken()
+                        ensureEngineStarted()
                     }
                 }
-            } catch (t: Throwable) {
-                Log.e(TAG, "Failed inside engine thread", t)
-                publishState(EngineState.ERROR, 0, "", t.stackTraceToString())
-            } finally {
-                engineStartingOrRunning.set(false)
-                releasePowerLocks()
-                if (restartPending.compareAndSet(true, false)) {
-                    sessionToken = generateSessionToken()
-                    ensureEngineStarted()
-                }
             }
+        } catch (t: Throwable) {
+            appendServiceLog("Failed scheduling engine start: ${t.javaClass.name}: ${t.message}")
+            engineStartingOrRunning.set(false)
+            releasePowerLocks()
+            publishState(EngineState.ERROR, 0, "", t.stackTraceToString())
         }
     }
 
     private fun requestRestart() {
         restartPending.set(true)
         publishState(EngineState.STARTING, 0, "", "正在重启本地引擎...")
-        if (engineStartingOrRunning.get()) {
+        if (engineStartingOrRunning.get() && nativeLibraryLoaded.get()) {
             try {
                 NativeNodeEngine.nativeStopNode()
             } catch (t: Throwable) {
@@ -352,15 +420,17 @@ class TavernEngineService : Service() {
 
     private fun shutdownEngine(stopSelfAfter: Boolean) {
         publishState(EngineState.STOPPED, 0, "", "")
-        try {
-            NativeNodeEngine.nativeStopNode()
-        } catch (t: Throwable) {
-            Log.w(TAG, "nativeStopNode error: ${t.message}")
+        if (nativeLibraryLoaded.get()) {
+            try {
+                NativeNodeEngine.nativeStopNode()
+            } catch (t: Throwable) {
+                Log.w(TAG, "nativeStopNode error: ${t.message}")
+            }
         }
         releasePowerLocks()
         if (stopSelfAfter) {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+            runCatching { stopSelf() }
         }
     }
 }

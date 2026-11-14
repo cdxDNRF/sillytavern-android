@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
@@ -35,6 +36,7 @@ std::once_flag g_stdio_redirect_once;
 std::mutex g_env_mutex;
 node::Environment* g_active_env = nullptr;
 std::atomic<bool> g_node_running{false};
+std::atomic<bool> g_stop_requested{false};
 
 std::once_flag g_node_process_init_once;
 std::shared_ptr<node::InitializationResult> g_init_result;
@@ -313,6 +315,13 @@ void JsNotifyError(const v8::FunctionCallbackInfo<v8::Value>& args) {
 bool InitializeNodeProcessOnce() {
     bool ok = true;
     std::call_once(g_node_process_init_once, [&ok]() {
+        // Ignore SIGPIPE for closed localhost sockets without resetting Android ART
+        // signal handlers (SIGSEGV/SIGQUIT/SIGUSR1) installed by libsigchain.
+        struct sigaction pipe_act {};
+        sigemptyset(&pipe_act.sa_mask);
+        pipe_act.sa_handler = SIG_IGN;
+        sigaction(SIGPIPE, &pipe_act, nullptr);
+
         std::vector<std::string> init_args = {
             "node",
             "--max-old-space-size=1536",
@@ -323,6 +332,8 @@ bool InitializeNodeProcessOnce() {
                 node::ProcessInitializationFlags::kNoInitializeV8,
                 node::ProcessInitializationFlags::kNoInitializeNodeV8Platform,
                 node::ProcessInitializationFlags::kDisableNodeOptionsEnv,
+                node::ProcessInitializationFlags::kNoDefaultSignalHandling,
+                node::ProcessInitializationFlags::kNoStdioInitialization,
             });
 
         if (!g_init_result) {
@@ -396,6 +407,7 @@ Java_com_sillytavern_app_engine_NativeNodeEngine_nativeStartNode(
     if (!g_node_running.compare_exchange_strong(expected, true)) {
         return -10;
     }
+    g_stop_requested.store(false);
 
     RedirectStdioToLogcatOnce();
 
@@ -499,6 +511,11 @@ Java_com_sillytavern_app_engine_NativeNodeEngine_nativeStartNode(
     v8::Isolate* isolate = setup->isolate();
     node::Environment* node_env = setup->env();
     int exit_code = 0;
+    bool loaded_ok = true;
+    static std::atomic<bool> s_has_js_exit_code{false};
+    static std::atomic<int> s_js_exit_code{0};
+    s_has_js_exit_code.store(false);
+    s_js_exit_code.store(0);
 
     {
         v8::Locker locker(isolate);
@@ -506,7 +523,9 @@ Java_com_sillytavern_app_engine_NativeNodeEngine_nativeStartNode(
         v8::HandleScope handle_scope(isolate);
         v8::Context::Scope context_scope(setup->context());
 
-        node::SetProcessExitHandler(node_env, [](node::Environment* target_env, int /*code*/) {
+        node::SetProcessExitHandler(node_env, [](node::Environment* target_env, int code) {
+            s_js_exit_code.store(code);
+            s_has_js_exit_code.store(true);
             node::Stop(target_env);
         });
 
@@ -544,32 +563,43 @@ Java_com_sillytavern_app_engine_NativeNodeEngine_nativeStartNode(
         v8::MaybeLocal<v8::Value> load_ret =
             node::LoadEnvironment(node_env, bootstrap_launcher, preload);
         if (load_ret.IsEmpty()) {
+            loaded_ok = false;
             NotifyErrorCallback("JavaScript exception occurred while loading SillyTavern bootstrap");
-            cleanup_callback();
-            return -14;
-        }
+        } else {
+            {
+                std::lock_guard<std::mutex> env_lock(g_env_mutex);
+                g_active_env = node_env;
+                if (g_stop_requested.load()) {
+                    node::Stop(node_env);
+                }
+            }
 
-        {
-            std::lock_guard<std::mutex> env_lock(g_env_mutex);
-            g_active_env = node_env;
-        }
+            v8::Maybe<int> spin_ret = node::SpinEventLoop(node_env);
+            if (spin_ret.IsJust()) {
+                exit_code = spin_ret.FromJust();
+            } else if (s_has_js_exit_code.load()) {
+                exit_code = s_js_exit_code.load();
+            } else {
+                // SpinEventLoop returns Nothing when stopped externally via node::Stop().
+                exit_code = 0;
+            }
 
-        exit_code = node::SpinEventLoop(node_env).FromMaybe(1);
-
-        {
-            std::lock_guard<std::mutex> env_lock(g_env_mutex);
-            g_active_env = nullptr;
+            {
+                std::lock_guard<std::mutex> env_lock(g_env_mutex);
+                g_active_env = nullptr;
+            }
         }
     }
 
     node::Stop(node_env);
     setup.reset();
     cleanup_callback();
-    return static_cast<jint>(exit_code);
+    return loaded_ok ? static_cast<jint>(exit_code) : -14;
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_sillytavern_app_engine_NativeNodeEngine_nativeStopNode(JNIEnv* /*env*/, jobject /*thiz*/) {
+    g_stop_requested.store(true);
     std::lock_guard<std::mutex> lock(g_env_mutex);
     if (g_active_env != nullptr) {
         node::Stop(g_active_env);

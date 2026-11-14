@@ -37,8 +37,10 @@ fun BootOverlay(
     state: Int,
     statusDetail: String,
     logsPreview: String,
+    elapsedSeconds: Int,
     onRetry: () -> Unit,
     onCopyLogs: () -> Unit,
+    onOpenLogs: () -> Unit,
     onRefreshLogs: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -69,94 +71,162 @@ fun BootOverlay(
 
             Spacer(modifier = Modifier.height(28.dp))
 
-            if (state == EngineState.ERROR) {
-                Surface(
-                    color = MaterialTheme.colorScheme.surface,
-                    shape = RoundedCornerShape(16.dp),
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Text(
-                            text = "本地引擎启动异常",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = MaterialTheme.colorScheme.error,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = statusDetail.ifBlank { "未知启动错误，请查看下方引擎日志。" },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurface,
-                        )
-                        if (logsPreview.isNotBlank()) {
-                            Spacer(modifier = Modifier.height(12.dp))
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(200.dp)
-                                    .background(Color(0xFF0C0D11), RoundedCornerShape(10.dp))
-                                    .padding(10.dp)
-                                    .verticalScroll(rememberScrollState()),
+            when (state) {
+                EngineState.ERROR -> {
+                    Surface(
+                        color = MaterialTheme.colorScheme.surface,
+                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Text(
+                                text = "本地引擎启动异常",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = MaterialTheme.colorScheme.error,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = statusDetail.ifBlank { "未知启动错误，请查看下方引擎日志。" },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
+                            if (logsPreview.isNotBlank()) {
+                                Spacer(modifier = Modifier.height(12.dp))
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(200.dp)
+                                        .background(Color(0xFF0C0D11), RoundedCornerShape(10.dp))
+                                        .padding(10.dp)
+                                        .verticalScroll(rememberScrollState()),
+                                ) {
+                                    Text(
+                                        text = logsPreview,
+                                        fontFamily = FontFamily.Monospace,
+                                        fontSize = 11.sp,
+                                        lineHeight = 15.sp,
+                                        color = Color(0xFFD6DCE8),
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(14.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
                             ) {
-                                Text(
-                                    text = logsPreview,
-                                    fontFamily = FontFamily.Monospace,
-                                    fontSize = 11.sp,
-                                    lineHeight = 15.sp,
-                                    color = Color(0xFFD6DCE8),
-                                )
+                                OutlinedButton(
+                                    onClick = {
+                                        onRefreshLogs()
+                                        onCopyLogs()
+                                    },
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Text("复制日志")
+                                }
+                                Button(
+                                    onClick = onRetry,
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Text("重试启动")
+                                }
                             }
                         }
-                        Spacer(modifier = Modifier.height(14.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    }
+                }
+
+                EngineState.STOPPED -> {
+                    Surface(
+                        color = MaterialTheme.colorScheme.surface,
+                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(18.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
                         ) {
-                            OutlinedButton(
-                                onClick = {
-                                    onRefreshLogs()
-                                    onCopyLogs()
-                                },
-                                modifier = Modifier.weight(1f),
+                            Text(
+                                text = "本地后台引擎已停止",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = statusDetail.ifBlank { "本地 Node.js 引擎当前未运行，点击下方按钮可重新拉起服务。" },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center,
+                            )
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
                             ) {
-                                Text("复制日志")
+                                OutlinedButton(
+                                    onClick = onOpenLogs,
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Text("查看日志")
+                                }
+                                Button(
+                                    onClick = onRetry,
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Text("重新启动引擎")
+                                }
                             }
-                            Button(
-                                onClick = onRetry,
-                                modifier = Modifier.weight(1f),
-                            ) {
+                        }
+                    }
+                }
+
+                else -> {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(40.dp),
+                        color = MaterialTheme.colorScheme.primary,
+                        strokeWidth = 3.dp,
+                    )
+                    Spacer(modifier = Modifier.height(18.dp))
+                    val label = when {
+                        statusDetail.isNotBlank() -> statusDetail
+                        state == EngineState.EXTRACTING -> "正在解包并校准内置运行环境..."
+                        state == EngineState.STARTING -> "正在启动嵌入式 Node.js 引擎..."
+                        state == EngineState.READY -> "正在加载 SillyTavern 界面..."
+                        else -> "正在连接本地后台服务..."
+                    }
+                    Text(
+                        text = label,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onBackground,
+                        textAlign = TextAlign.Center,
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    val subHint = if (elapsedSeconds >= 3) {
+                        "已等待 ${elapsedSeconds}s · 所有数据仅保存在应用私有目录内"
+                    } else {
+                        "所有角色卡、预设与对话均保存在应用私有目录内"
+                    }
+                    Text(
+                        text = subHint,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center,
+                    )
+
+                    if (elapsedSeconds >= 5) {
+                        Spacer(modifier = Modifier.height(20.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            OutlinedButton(onClick = onOpenLogs) {
+                                Text("查看日志")
+                            }
+                            OutlinedButton(onClick = onRetry) {
                                 Text("重试启动")
                             }
                         }
                     }
                 }
-            } else {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(40.dp),
-                    color = MaterialTheme.colorScheme.primary,
-                    strokeWidth = 3.dp,
-                )
-                Spacer(modifier = Modifier.height(18.dp))
-                val label = when {
-                    statusDetail.isNotBlank() -> statusDetail
-                    state == EngineState.EXTRACTING -> "正在解包并校准内置运行环境..."
-                    state == EngineState.STARTING -> "正在启动嵌入式 Node.js 引擎..."
-                    state == EngineState.READY -> "正在加载 SillyTavern 界面..."
-                    else -> "正在连接本地后台服务..."
-                }
-                Text(
-                    text = label,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onBackground,
-                    textAlign = TextAlign.Center,
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = "所有角色卡、预设与对话均保存在应用私有目录内",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    textAlign = TextAlign.Center,
-                )
             }
         }
     }

@@ -20,6 +20,7 @@ import android.webkit.CookieManager
 import android.webkit.URLUtil
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -80,6 +81,8 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLDecoder
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -94,11 +97,15 @@ class MainActivity : ComponentActivity() {
     private lateinit var webChromeClient: TavernWebChromeClient
 
     private var engineBinder: ITavernEngine? = null
-    private var serviceBound = false
+    private var bindRequested = false
+    private var serviceConnected = false
+    private var notificationPermissionRequested = false
+    private var startupWatchdogJob: Job? = null
 
     private var engineState by mutableIntStateOf(EngineState.IDLE)
     private var enginePort by mutableIntStateOf(0)
     private var engineDetail by mutableStateOf("")
+    private var bootElapsedSeconds by mutableIntStateOf(0)
     private var assetVersion by mutableStateOf("")
     private var logsText by mutableStateOf("")
     private var exportsList by mutableStateOf<List<ExportItem>>(emptyList())
@@ -131,8 +138,14 @@ class MainActivity : ComponentActivity() {
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             val binder = ITavernEngine.Stub.asInterface(service)
+            if (binder == null) {
+                engineBinder = null
+                serviceConnected = false
+                handleEngineStateUpdate(EngineState.ERROR, 0, "引擎服务返回了空的 Binder 接口。")
+                return
+            }
             engineBinder = binder
-            serviceBound = true
+            serviceConnected = true
             try {
                 binder.registerCallback(engineCallback)
                 assetVersion = binder.installedAssetVersion ?: ""
@@ -143,16 +156,54 @@ class MainActivity : ComponentActivity() {
                 if (state == EngineState.IDLE || state == EngineState.STOPPED) {
                     binder.startEngine()
                 }
+                refreshEngineLogs()
             } catch (t: Throwable) {
                 Log.e(TAG, "Error querying bound engine service", t)
+                refreshEngineLogs()
+                handleEngineStateUpdate(
+                    EngineState.ERROR,
+                    0,
+                    "连接本地引擎服务失败 (${t.javaClass.simpleName}): ${t.message ?: "未知异常"}",
+                )
             }
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             engineBinder = null
-            serviceBound = false
+            serviceConnected = false
             webViewPageLoaded = false
             lastLoadedSessionKey = ""
+            if (engineState != EngineState.STOPPED) {
+                refreshEngineLogs()
+                handleEngineStateUpdate(
+                    EngineState.ERROR,
+                    0,
+                    "与本地后台服务的连接已断开 (onServiceDisconnected)，请点击重试启动。",
+                )
+            }
+        }
+
+        override fun onBindingDied(name: ComponentName?) {
+            engineBinder = null
+            serviceConnected = false
+            webViewPageLoaded = false
+            lastLoadedSessionKey = ""
+            refreshEngineLogs()
+            handleEngineStateUpdate(
+                EngineState.ERROR,
+                0,
+                "本地后台服务连接已失效 (onBindingDied)，请点击重试启动。",
+            )
+        }
+
+        override fun onNullBinding(name: ComponentName?) {
+            engineBinder = null
+            serviceConnected = false
+            handleEngineStateUpdate(
+                EngineState.ERROR,
+                0,
+                "本地引擎服务返回空绑定 (onNullBinding)。",
+            )
         }
     }
 
@@ -220,8 +271,8 @@ class MainActivity : ComponentActivity() {
             },
         )
 
-        requestNotificationPermissionIfNeeded()
         startAndBindEngineService()
+        startStartupWatchdog()
 
         setContent {
             SillyTavernAppTheme {
@@ -233,8 +284,9 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         exportsList = exportRepository.listExports()
-        if (!serviceBound) {
-            bindEngineService()
+        if (!bindRequested) {
+            startAndBindEngineService()
+            startStartupWatchdog()
         }
     }
 
@@ -249,15 +301,21 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        startupWatchdogJob?.cancel()
         webChromeClient.cancelPendingFileChooser()
         exportBridge.releaseAll()
-        if (serviceBound) {
+        if (bindRequested) {
             try {
                 engineBinder?.unregisterCallback(engineCallback)
             } catch (_: Exception) {
             }
-            unbindService(serviceConnection)
-            serviceBound = false
+            try {
+                unbindService(serviceConnection)
+            } catch (_: Exception) {
+            }
+            bindRequested = false
+            serviceConnected = false
+            engineBinder = null
         }
         webViewRef?.let { wv ->
             wv.stopLoading()
@@ -286,10 +344,12 @@ class MainActivity : ComponentActivity() {
                 .background(Color(0xFF121318))
                 .windowInsetsPadding(WindowInsets.safeDrawing.union(WindowInsets.ime)),
         ) {
-            AndroidView(
-                factory = { ctx -> createConfiguredWebView(ctx) },
-                modifier = Modifier.fillMaxSize(),
-            )
+            if (engineState == EngineState.READY || webViewRef != null) {
+                AndroidView(
+                    factory = { ctx -> createConfiguredWebView(ctx) },
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
 
             AnimatedVisibility(
                 visible = engineState != EngineState.READY || !webViewPageLoaded,
@@ -300,8 +360,13 @@ class MainActivity : ComponentActivity() {
                     state = engineState,
                     statusDetail = engineDetail,
                     logsPreview = logsText,
+                    elapsedSeconds = bootElapsedSeconds,
                     onRetry = { retryEngineStart() },
                     onCopyLogs = { copyLogsToClipboard() },
+                    onOpenLogs = {
+                        refreshEngineLogs()
+                        showDiagnosticsDialog = true
+                    },
                     onRefreshLogs = { refreshEngineLogs() },
                 )
             }
@@ -483,7 +548,11 @@ class MainActivity : ComponentActivity() {
 
                 override fun onPageFinished(view: WebView?, url: String?) {
                     super.onPageFinished(view, url)
-                    if (engineState == EngineState.READY && !url.isNullOrBlank() && !url.endsWith("/_app/bootstrap")) {
+                    if (engineState == EngineState.READY &&
+                        !url.isNullOrBlank() &&
+                        !url.contains("/_app/bootstrap") &&
+                        !url.startsWith("about:blank")
+                    ) {
                         webViewPageLoaded = true
                     }
                 }
@@ -495,7 +564,35 @@ class MainActivity : ComponentActivity() {
                 ) {
                     super.onReceivedError(view, request, error)
                     if (request?.isForMainFrame == true) {
-                        Log.w(TAG, "WebView main frame error ${error?.errorCode}: ${error?.description}")
+                        val desc = error?.description?.toString() ?: "未知网络错误"
+                        Log.w(TAG, "WebView main frame error ${error?.errorCode}: $desc (${request.url})")
+                        if (!desc.contains("ERR_ABORTED", ignoreCase = true)) {
+                            refreshEngineLogs()
+                            handleEngineStateUpdate(
+                                EngineState.ERROR,
+                                enginePort,
+                                "应用内页面加载失败 (${error?.errorCode}): $desc\n目标地址: ${request.url}",
+                            )
+                        }
+                    }
+                }
+
+                override fun onReceivedHttpError(
+                    view: WebView?,
+                    request: WebResourceRequest?,
+                    errorResponse: WebResourceResponse?,
+                ) {
+                    super.onReceivedHttpError(view, request, errorResponse)
+                    val statusCode = errorResponse?.statusCode ?: 0
+                    if (request?.isForMainFrame == true && statusCode >= 400) {
+                        val reason = errorResponse?.reasonPhrase ?: ""
+                        Log.w(TAG, "WebView main frame HTTP $statusCode: $reason (${request.url})")
+                        refreshEngineLogs()
+                        handleEngineStateUpdate(
+                            EngineState.ERROR,
+                            enginePort,
+                            "本地 SillyTavern 服务返回异常响应 HTTP $statusCode $reason\n目标地址: ${request.url}",
+                        )
                     }
                 }
             }
@@ -545,15 +642,18 @@ class MainActivity : ComponentActivity() {
 
         when (stateCode) {
             EngineState.READY -> {
+                requestNotificationPermissionIfNeeded()
                 maybeLoadBootstrapIntoWebView()
             }
             EngineState.ERROR -> {
                 webViewPageLoaded = false
+                lastLoadedSessionKey = ""
                 refreshEngineLogs()
             }
             EngineState.IDLE, EngineState.EXTRACTING, EngineState.STARTING, EngineState.STOPPED -> {
-                if (stateCode != EngineState.READY) {
-                    webViewPageLoaded = false
+                webViewPageLoaded = false
+                if (stateCode == EngineState.STOPPED) {
+                    lastLoadedSessionKey = ""
                 }
             }
         }
@@ -580,8 +680,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun reloadWebViewWithBootstrap() {
-        val wv = webViewRef ?: return
-        if (engineState != EngineState.READY || enginePort <= 0) {
+        val wv = webViewRef
+        if (wv == null || engineState != EngineState.READY || enginePort <= 0) {
             retryEngineStart()
             return
         }
@@ -727,46 +827,157 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun startStartupWatchdog() {
+        startupWatchdogJob?.cancel()
+        bootElapsedSeconds = 0
+        startupWatchdogJob = lifecycleScope.launch {
+            var idleSeconds = 0
+            while (engineState != EngineState.READY || !webViewPageLoaded) {
+                delay(1_000L)
+                bootElapsedSeconds += 1
+                if (engineState == EngineState.ERROR || engineState == EngineState.STOPPED) {
+                    break
+                }
+                if (engineState == EngineState.IDLE) {
+                    idleSeconds += 1
+                    if (idleSeconds >= 8) {
+                        refreshEngineLogs()
+                        handleEngineStateUpdate(
+                            EngineState.ERROR,
+                            0,
+                            "连接本地后台服务超时（8 秒未收到引擎状态）。\n" +
+                                "服务状态: bindRequested=$bindRequested, connected=$serviceConnected。\n" +
+                                "请点击下方「复制日志」或「重试启动」。",
+                        )
+                        break
+                    }
+                } else {
+                    idleSeconds = 0
+                }
+                if (showDiagnosticsDialog || bootElapsedSeconds % 3 == 0) {
+                    refreshEngineLogs()
+                }
+            }
+        }
+    }
+
+    private fun startEngineServiceIntent(intent: Intent) {
+        try {
+            startService(intent)
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "startService fell back to startForegroundService: ${e.message}")
+            try {
+                ContextCompat.startForegroundService(this, intent)
+            } catch (t: Throwable) {
+                Log.e(TAG, "Failed to start TavernEngineService", t)
+                handleEngineStateUpdate(
+                    EngineState.ERROR,
+                    0,
+                    "无法启动本地后台服务 (${t.javaClass.simpleName}): ${t.message ?: "请检查应用权限"}",
+                )
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "Failed to start TavernEngineService", t)
+            handleEngineStateUpdate(
+                EngineState.ERROR,
+                0,
+                "无法启动本地后台服务 (${t.javaClass.simpleName}): ${t.message}",
+            )
+        }
+    }
+
     private fun startAndBindEngineService() {
+        bindEngineService()
         val startIntent = Intent(this, TavernEngineService::class.java).apply {
             action = TavernEngineService.ACTION_START
         }
-        ContextCompat.startForegroundService(this, startIntent)
+        startEngineServiceIntent(startIntent)
+    }
+
+    private fun rebindEngineServiceConnection() {
+        if (bindRequested) {
+            try {
+                engineBinder?.unregisterCallback(engineCallback)
+            } catch (_: Exception) {
+            }
+            try {
+                unbindService(serviceConnection)
+            } catch (_: Exception) {
+            }
+            bindRequested = false
+            engineBinder = null
+            serviceConnected = false
+        }
         bindEngineService()
     }
 
-    private fun bindEngineService() {
-        val bindIntent = Intent(this, TavernEngineService::class.java)
-        bindService(bindIntent, serviceConnection, Context.BIND_AUTO_CREATE)
+    private fun bindEngineService(): Boolean {
+        if (bindRequested) return true
+        return try {
+            val bindIntent = Intent(this, TavernEngineService::class.java)
+            val ok = bindService(bindIntent, serviceConnection, Context.BIND_AUTO_CREATE)
+            bindRequested = ok
+            if (!ok) {
+                handleEngineStateUpdate(
+                    EngineState.ERROR,
+                    0,
+                    "系统拒绝绑定本地引擎服务 (bindService=false)，请检查应用权限后重试。",
+                )
+            }
+            ok
+        } catch (t: Throwable) {
+            Log.e(TAG, "bindService failed", t)
+            handleEngineStateUpdate(
+                EngineState.ERROR,
+                0,
+                "绑定本地引擎服务失败 (${t.javaClass.simpleName}): ${t.message}",
+            )
+            false
+        }
     }
 
     private fun retryEngineStart() {
         lastLoadedSessionKey = ""
         webViewPageLoaded = false
+        logsText = ""
         val binder = engineBinder
         if (binder != null) {
             try {
-                binder.startEngine()
+                val state = binder.currentState
+                if (state == EngineState.IDLE || state == EngineState.STOPPED) {
+                    binder.startEngine()
+                } else {
+                    restartEngineFromUi()
+                }
+                startStartupWatchdog()
                 return
             } catch (_: Exception) {
             }
         }
-        startAndBindEngineService()
+        rebindEngineServiceConnection()
+        val startIntent = Intent(this, TavernEngineService::class.java).apply {
+            action = TavernEngineService.ACTION_START
+        }
+        startEngineServiceIntent(startIntent)
+        startStartupWatchdog()
     }
 
     private fun restartEngineFromUi() {
         lastLoadedSessionKey = ""
         webViewPageLoaded = false
+        logsText = ""
+        if (!bindRequested || engineBinder == null) {
+            rebindEngineServiceConnection()
+        }
         val restartIntent = Intent(this, TavernEngineService::class.java).apply {
             action = TavernEngineService.ACTION_RESTART
         }
-        ContextCompat.startForegroundService(this, restartIntent)
-        if (!serviceBound) {
-            bindEngineService()
-        }
+        startEngineServiceIntent(restartIntent)
+        startStartupWatchdog()
     }
 
     private fun stopEngineAndFinish() {
+        startupWatchdogJob?.cancel()
         try {
             engineBinder?.stopEngine()
         } catch (_: Exception) {
@@ -774,13 +985,28 @@ class MainActivity : ComponentActivity() {
         val stopIntent = Intent(this, TavernEngineService::class.java).apply {
             action = TavernEngineService.ACTION_STOP
         }
-        startService(stopIntent)
+        runCatching { startService(stopIntent) }
         finishAndRemoveTask()
     }
 
     private fun refreshEngineLogs() {
+        val binder = engineBinder
+        if (binder == null) {
+            if (logsText.isBlank()) {
+                logsText = buildString {
+                    append("[MainActivity] binder=null, bindRequested=$bindRequested, connected=$serviceConnected, state=$engineState\n")
+                    if (engineDetail.isNotBlank()) {
+                        append("[MainActivity] detail=$engineDetail\n")
+                    }
+                }
+            }
+            return
+        }
         try {
-            logsText = engineBinder?.recentLogs ?: logsText
+            val fetched = binder.recentLogs
+            if (!fetched.isNullOrBlank()) {
+                logsText = fetched
+            }
         } catch (t: Throwable) {
             logsText = "获取日志失败: ${t.message}"
         }
@@ -795,13 +1021,17 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestNotificationPermissionIfNeeded() {
+        if (notificationPermissionRequested) return
+        notificationPermissionRequested = true
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val granted = ContextCompat.checkSelfPermission(
                 this,
                 Manifest.permission.POST_NOTIFICATIONS,
             ) == PackageManager.PERMISSION_GRANTED
             if (!granted) {
-                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                runCatching {
+                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                }
             }
         }
     }
