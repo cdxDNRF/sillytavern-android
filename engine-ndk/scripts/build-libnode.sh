@@ -79,8 +79,8 @@ for tool in "$CC_TARGET" "$CXX_TARGET" "$AR_TARGET" "$RANLIB_TARGET" "$STRIP_TAR
     fi
 done
 
-TARGET_CFLAGS="-fPIC"
-TARGET_CXXFLAGS="-fPIC"
+TARGET_CFLAGS="-fPIC -g0 -pipe"
+TARGET_CXXFLAGS="-fPIC -g0 -pipe"
 TARGET_LDFLAGS="-nostdlib++ -lc++_shared -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384"
 
 log "Using NDK: $NDK_HOME (API $ANDROID_API, NODE $NODE_VERSION, intl=$INTL_MODE)"
@@ -177,8 +177,8 @@ export CC_host="${CC_host:-gcc}"
 export CXX_host="${CXX_host:-g++}"
 export AR_host="${AR_host:-ar}"
 export LINK_host="${LINK_host:-g++}"
-export CFLAGS_host=""
-export CXXFLAGS_host=""
+export CFLAGS_host="${CFLAGS_host:--O1 -g0 -pipe}"
+export CXXFLAGS_host="${CXXFLAGS_host:--O1 -g0 -pipe}"
 export LDFLAGS_host=""
 
 export GYP_DEFINES="target_arch=arm64 v8_target_arch=arm64 android_target_arch=arm64 host_os=$HOST_OS OS=android android_ndk_path=$NDK_HOME"
