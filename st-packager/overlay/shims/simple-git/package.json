@@ -1,0 +1,13 @@
+{
+  "name": "simple-git",
+  "version": "3.33.0-android-purejs",
+  "description": "Self-written pure-JS simple-git compatibility layer powered by isomorphic-git for SillyTavern Android",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": {
+      "import": "./index.js",
+      "default": "./index.js"
+    }
+  }
+}

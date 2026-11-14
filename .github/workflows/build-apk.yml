@@ -1,0 +1,328 @@
+name: Build SillyTavern Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      sillytavern_ref:
+        description: 'SillyTavern branch, tag, or commit to bundle (e.g. release, staging, 1.19.0)'
+        required: true
+        default: 'release'
+        type: string
+      node_version:
+        description: 'Embedded Node.js LTS tag (reuses cached engine-node-<tag> release if available)'
+        required: true
+        default: 'v22.23.5'
+        type: string
+      create_release:
+        description: 'Publish installable APK directly to GitHub Releases'
+        required: true
+        default: true
+        type: boolean
+      rebuild_engine:
+        description: 'Force rebuilding libnode.so instead of reusing prebuilt release'
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'README.md'
+
+permissions:
+  contents: write
+
+jobs:
+  package-sillytavern:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    outputs:
+      st_version: ${{ steps.meta.outputs.st_version }}
+      st_commit: ${{ steps.meta.outputs.st_commit }}
+      st_sha256: ${{ steps.meta.outputs.st_sha256 }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Package & verify SillyTavern bundle
+        env:
+          ST_REF: ${{ github.event.inputs.sillytavern_ref || 'release' }}
+        run: |
+          set -euo pipefail
+          node st-packager/package.mjs \
+            --ref "${ST_REF}" \
+            --work "${{ runner.temp }}/st-work" \
+            --out "${{ runner.temp }}/st-out"
+
+      - name: Read bundle metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+          meta = json.loads(Path("${{ runner.temp }}/st-out/st_meta.json").read_text(encoding="utf-8"))
+          print(f"st_version={meta['sillytavernVersion']}")
+          print(f"st_commit={meta['upstreamCommit']}")
+          print(f"st_sha256={meta['sha256']}")
+          PY
+
+      - name: Upload packaged SillyTavern bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaged-sillytavern
+          path: |
+            ${{ runner.temp }}/st-out/st_app.zip
+            ${{ runner.temp }}/st-out/st_app.sha256
+            ${{ runner.temp }}/st-out/st_meta.json
+          retention-days: 7
+
+  prepare-node-engine:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download prebuilt libnode.so or cross-compile on demand
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NODE_VERSION: ${{ github.event.inputs.node_version || 'v22.23.5' }}
+          REBUILD_ENGINE: ${{ github.event.inputs.rebuild_engine || 'false' }}
+        run: |
+          set -euo pipefail
+          OUT_DIR="${{ runner.temp }}/engine-out"
+          mkdir -p "${OUT_DIR}"
+          ENGINE_TAG="engine-node-${NODE_VERSION}"
+
+          DOWNLOADED=false
+          if [[ "${REBUILD_ENGINE}" != "true" ]] && gh release view "${ENGINE_TAG}" >/dev/null 2>&1; then
+            echo "Found prebuilt release ${ENGINE_TAG}, downloading..."
+            if gh release download "${ENGINE_TAG}" \
+              --pattern "libnode-android-arm64.tar.gz*" \
+              --dir "${OUT_DIR}"; then
+              if [[ -f "${OUT_DIR}/libnode-android-arm64.tar.gz" && -f "${OUT_DIR}/libnode-android-arm64.tar.gz.sha256" ]]; then
+                (
+                  cd "${OUT_DIR}"
+                  sed -E 's|  .*/([^/]+)$|  \1|' libnode-android-arm64.tar.gz.sha256 | sha256sum -c -
+                )
+                DOWNLOADED=true
+                echo "Verified prebuilt libnode engine archive cleanly."
+              fi
+            fi
+          fi
+
+          if [[ "${DOWNLOADED}" != "true" ]]; then
+            echo "Prebuilt engine unavailable or rebuild requested; cross-compiling Node.js ${NODE_VERSION}..."
+            SDKMANAGER="$(command -v sdkmanager || find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -n 1)"
+            if [[ -z "${SDKMANAGER}" || ! -x "${SDKMANAGER}" ]]; then
+              echo "ERROR: sdkmanager not found under ANDROID_HOME=${ANDROID_HOME:-}" >&2
+              exit 1
+            fi
+            (set +o pipefail; yes | "${SDKMANAGER}" --licenses >/dev/null || true)
+            "${SDKMANAGER}" --install "ndk;27.2.12479018"
+
+            chmod +x engine-ndk/scripts/build-libnode.sh
+            ANDROID_API=29 \
+            INTL_MODE=full-icu \
+            WORK_DIR="${{ runner.temp }}/node-work" \
+            OUT_DIR="${OUT_DIR}" \
+            ./engine-ndk/scripts/build-libnode.sh
+
+            if gh release view "${ENGINE_TAG}" >/dev/null 2>&1; then
+              gh release upload "${ENGINE_TAG}" \
+                "${OUT_DIR}/libnode-android-arm64.tar.gz" \
+                "${OUT_DIR}/libnode-android-arm64.tar.gz.sha256" \
+                --clobber || true
+            else
+              gh release create "${ENGINE_TAG}" \
+                "${OUT_DIR}/libnode-android-arm64.tar.gz" \
+                "${OUT_DIR}/libnode-android-arm64.tar.gz.sha256" \
+                --prerelease \
+                --title "Embedded libnode ${NODE_VERSION} (Android arm64-v8a)" \
+                --notes "Prebuilt embedded Node.js shared library (full-icu, Android API 29+, 16 KB ELF alignment)." || true
+            fi
+          fi
+
+      - name: Upload Node engine artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libnode-android-arm64
+          path: |
+            ${{ runner.temp }}/engine-out/libnode-android-arm64.tar.gz
+            ${{ runner.temp }}/engine-out/libnode-android-arm64.tar.gz.sha256
+          retention-days: 7
+
+  build-android-apk:
+    runs-on: ubuntu-24.04
+    needs: [package-sillytavern, prepare-node-engine]
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Download SillyTavern bundle & libnode engine
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/deps
+
+      - name: Stage prebuilt libnode.so, headers, and st_app.zip
+        run: |
+          set -euo pipefail
+          ENGINE_TAR="${{ runner.temp }}/deps/libnode-android-arm64/libnode-android-arm64.tar.gz"
+          ST_OUT="${{ runner.temp }}/deps/packaged-sillytavern"
+
+          rm -rf engine-ndk/prebuilt
+          mkdir -p engine-ndk/prebuilt
+          tar -xzf "${ENGINE_TAR}" -C engine-ndk/prebuilt lib/arm64-v8a/libnode.so include BUILD_INFO.txt
+          test -f engine-ndk/prebuilt/include/node/node.h
+          test -f engine-ndk/prebuilt/lib/arm64-v8a/libnode.so
+
+          mkdir -p android-app/app/src/main/assets
+          cp "${ST_OUT}/st_app.zip" android-app/app/src/main/assets/st_app.zip
+          cp "${ST_OUT}/st_app.sha256" android-app/app/src/main/assets/st_app.sha256
+
+      - name: Install Android SDK 35, NDK 27.2, and CMake
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$(command -v sdkmanager || find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -n 1)"
+          if [[ -z "${SDKMANAGER}" || ! -x "${SDKMANAGER}" ]]; then
+            echo "ERROR: sdkmanager not found under ANDROID_HOME=${ANDROID_HOME:-}" >&2
+            exit 1
+          fi
+          (set +o pipefail; yes | "${SDKMANAGER}" --licenses >/dev/null || true)
+          "${SDKMANAGER}" --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+
+      - name: Prepare optional release keystore
+        id: sign
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${KEYSTORE_B64}" && -n "${KEYSTORE_PASS}" && -n "${KEY_ALIAS}" && -n "${KEY_PASS}" ]]; then
+            echo "${KEYSTORE_B64}" | base64 -d > "${{ runner.temp }}/release.jks"
+            echo "store_file=${{ runner.temp }}/release.jks" >> "$GITHUB_OUTPUT"
+            echo "has_release_key=true" >> "$GITHUB_OUTPUT"
+            echo "Using persistent repository ANDROID_KEYSTORE_BASE64 signing key."
+          else
+            echo "store_file=" >> "$GITHUB_OUTPUT"
+            echo "has_release_key=false" >> "$GITHUB_OUTPUT"
+            echo "ANDROID_KEYSTORE_BASE64 secrets not configured; falling back to runner debug keystore."
+          fi
+
+      - name: Set up Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Build release APK
+        env:
+          ST_SIGN_STORE_FILE: ${{ steps.sign.outputs.store_file }}
+          ST_SIGN_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ST_SIGN_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ST_SIGN_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ST_VER: ${{ needs.package-sillytavern.outputs.st_version }}
+          RUN_NUM: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          gradle -p android-app :app:assembleRelease --no-daemon \
+            -PappVersionName="${ST_VER}-android.${RUN_NUM}" \
+            -PappVersionCode="${RUN_NUM}"
+
+      - name: Verify APK structure, 16KB page alignment, and signature
+        env:
+          ST_VER: ${{ needs.package-sillytavern.outputs.st_version }}
+          ST_COMMIT: ${{ needs.package-sillytavern.outputs.st_commit }}
+          HAS_RELEASE_KEY: ${{ steps.sign.outputs.has_release_key }}
+        run: |
+          set -euo pipefail
+          RAW_APK="$(find android-app/app/build/outputs/apk/release -name "*.apk" -type f | head -n 1)"
+          if [[ -z "${RAW_APK}" || ! -f "${RAW_APK}" ]]; then
+            echo "ERROR: Built APK not found!" >&2
+            exit 1
+          fi
+
+          DIST_DIR="${{ runner.temp }}/apk-dist"
+          mkdir -p "${DIST_DIR}"
+          FINAL_APK="${DIST_DIR}/SillyTavern-v${ST_VER}-arm64-release.apk"
+          cp "${RAW_APK}" "${FINAL_APK}"
+          (
+            cd "${DIST_DIR}"
+            sha256sum "$(basename "${FINAL_APK}")" > "$(basename "${FINAL_APK}").sha256"
+          )
+
+          echo "=== APK Native & Asset Entries ==="
+          unzip -l "${FINAL_APK}" | grep -E "assets/st_app|lib/arm64-v8a/"
+
+          for required in "assets/st_app.zip" "assets/st_app.sha256" "lib/arm64-v8a/libnode.so" "lib/arm64-v8a/libst_bridge.so" "lib/arm64-v8a/libc++_shared.so"; do
+            if ! unzip -Z1 "${FINAL_APK}" | grep -qx "${required}"; then
+              echo "ERROR: Missing required APK entry: ${required}" >&2
+              exit 1
+            fi
+          done
+
+          echo "=== Verifying 16KB ZIP alignment & APK Signature ==="
+          "${ANDROID_HOME}/build-tools/35.0.0/zipalign" -c -P 16 -v 4 "${FINAL_APK}" | tail -n 15
+          "${ANDROID_HOME}/build-tools/35.0.0/apksigner" verify --verbose --print-certs "${FINAL_APK}"
+
+          {
+            echo "## SillyTavern Android APK Build Summary"
+            echo "- **SillyTavern Version**: \`${ST_VER}\` (\`${ST_COMMIT}\`)"
+            echo "- **APK File**: \`$(basename "${FINAL_APK}")\` ($(du -h "${FINAL_APK}" | cut -f1))"
+            echo "- **Runtime Bundle SHA-256**: \`${{ needs.package-sillytavern.outputs.st_sha256 }}\`"
+            echo "- **Architecture / Page Align**: \`arm64-v8a\` (minSdk 29 / targetSdk 35 / 16 KB aligned)"
+            if [[ "${HAS_RELEASE_KEY}" == "true" ]]; then
+              echo "- **Signing**: Custom release keystore (supports overwrite upgrades preserving \`st_data/\`)"
+            else
+              echo "- **Signing**: Debug keystore fallback. Add \`ANDROID_KEYSTORE_BASE64\`, \`ANDROID_KEYSTORE_PASSWORD\`, \`ANDROID_KEY_ALIAS\`, and \`ANDROID_KEY_PASSWORD\` repository secrets for seamless in-place APK upgrades across future builds."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sillytavern-android-arm64-apk
+          path: |
+            ${{ runner.temp }}/apk-dist/*.apk
+            ${{ runner.temp }}/apk-dist/*.sha256
+          retention-days: 30
+
+      - name: Publish GitHub Release with APK
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.create_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ST_VER: ${{ needs.package-sillytavern.outputs.st_version }}
+          ST_COMMIT: ${{ needs.package-sillytavern.outputs.st_commit }}
+          RUN_NUM: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          DIST_DIR="${{ runner.temp }}/apk-dist"
+          FINAL_APK="${DIST_DIR}/SillyTavern-v${ST_VER}-arm64-release.apk"
+          RELEASE_TAG="v${ST_VER}-android.b${RUN_NUM}"
+          NOTES=$(cat <<EOF
+          Automated cloud build for SillyTavern Android (self-contained embedded Node.js + WebView sandbox).
+
+          - SillyTavern: \`${ST_VER}\` (\`${ST_COMMIT}\`)
+          - Target: \`arm64-v8a\` (Android 10+ / API 29+, targetSdk 35, 16 KB aligned)
+          - Storage: Strictly app-private sandbox (\`filesDir\`), uninstalling removes 100% of files cleanly.
+          EOF
+          )
+          gh release create "${RELEASE_TAG}" \
+            "${FINAL_APK}" \
+            "${FINAL_APK}.sha256" \
+            --title "SillyTavern Android v${ST_VER} (Build #${RUN_NUM})" \
+            --notes "${NOTES}"

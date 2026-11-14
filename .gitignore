@@ -1,0 +1,27 @@
+# Node.js NDK build artifacts & working trees
+.node-build-work/
+engine-ndk/dist/
+engine-ndk/prebuilt/
+
+# SillyTavern packager working & output artifacts
+st-packager/.work/
+st-packager/dist/
+st-packager/node_modules/
+
+# Android Gradle & generated runtime assets
+android-app/.gradle/
+android-app/.idea/
+android-app/local.properties
+android-app/build/
+android-app/**/build/
+android-app/**/.cxx/
+android-app/app/src/main/assets/st_app.zip
+android-app/app/src/main/assets/st_app.sha256
+
+# Packages, signing keys, and editor junk
+*.apk
+*.aab
+*.jks
+*.keystore
+*.iml
+.DS_Store

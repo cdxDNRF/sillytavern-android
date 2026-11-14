@@ -1,0 +1,83 @@
+name: Build Embedded Node.js Engine (arm64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      node_version:
+        description: 'Node.js LTS release tag to cross-compile'
+        required: true
+        default: 'v22.23.5'
+        type: string
+      intl_mode:
+        description: 'ICU internationalization mode (full-icu recommended for SillyTavern)'
+        required: true
+        default: 'full-icu'
+        type: choice
+        options:
+          - full-icu
+          - small-icu
+          - none
+
+permissions:
+  contents: write
+
+jobs:
+  build-libnode:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Ensure Android NDK 27.2.12479018
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$(command -v sdkmanager || find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -n 1)"
+          if [[ -z "${SDKMANAGER}" || ! -x "${SDKMANAGER}" ]]; then
+            echo "ERROR: sdkmanager not found under ANDROID_HOME=${ANDROID_HOME:-}" >&2
+            exit 1
+          fi
+          (set +o pipefail; yes | "${SDKMANAGER}" --licenses >/dev/null || true)
+          "${SDKMANAGER}" --install "ndk;27.2.12479018"
+
+      - name: Cross-compile libnode.so (arm64-v8a, API 29, 16KB page align)
+        env:
+          NODE_VERSION: ${{ inputs.node_version }}
+          INTL_MODE: ${{ inputs.intl_mode }}
+          ANDROID_API: '29'
+          OUT_DIR: ${{ runner.temp }}/node-out
+          WORK_DIR: ${{ runner.temp }}/node-work
+        run: |
+          set -euo pipefail
+          chmod +x engine-ndk/scripts/build-libnode.sh
+          ./engine-ndk/scripts/build-libnode.sh
+
+      - name: Upload Node engine artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libnode-android-arm64-${{ inputs.node_version }}
+          path: |
+            ${{ runner.temp }}/node-out/libnode-android-arm64.tar.gz
+            ${{ runner.temp }}/node-out/libnode-android-arm64.tar.gz.sha256
+          retention-days: 30
+
+      - name: Publish prebuilt engine release for fast APK builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ENGINE_TAG: engine-node-${{ inputs.node_version }}
+        run: |
+          set -euo pipefail
+          OUT_DIR="${{ runner.temp }}/node-out"
+          if gh release view "${ENGINE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${ENGINE_TAG}" \
+              "${OUT_DIR}/libnode-android-arm64.tar.gz" \
+              "${OUT_DIR}/libnode-android-arm64.tar.gz.sha256" \
+              --clobber
+          else
+            gh release create "${ENGINE_TAG}" \
+              "${OUT_DIR}/libnode-android-arm64.tar.gz" \
+              "${OUT_DIR}/libnode-android-arm64.tar.gz.sha256" \
+              --prerelease \
+              --title "Embedded libnode ${{ inputs.node_version }} (Android arm64-v8a)" \
+              --notes "Prebuilt embedded Node.js shared library (${{ inputs.intl_mode }}, Android API 29+, 16 KB ELF alignment) for SillyTavern Android APK builds."
+          fi

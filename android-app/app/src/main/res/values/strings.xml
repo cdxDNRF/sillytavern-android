@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SillyTavern</string>
+    <string name="engine_channel_name">本地酒馆后台引擎</string>
+    <string name="engine_channel_desc">保持本地 Node.js 与 SillyTavern AI 对话引擎在后台稳定运行</string>
+</resources>

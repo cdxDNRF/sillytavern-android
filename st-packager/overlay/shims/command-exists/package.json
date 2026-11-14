@@ -1,0 +1,13 @@
+{
+  "name": "command-exists",
+  "version": "1.2.9-android-shim",
+  "description": "Self-written safe command-exists shim for SillyTavern Android embedded Node",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": {
+      "import": "./index.js",
+      "default": "./index.js"
+    }
+  }
+}
