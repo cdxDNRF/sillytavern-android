@@ -152,7 +152,7 @@ object DiagLogStore {
         return runCatching {
             val am = context.getSystemService(ActivityManager::class.java)
                 ?: return@runCatching "(ActivityManager unavailable)"
-            val exits = am.getHistoricalProcessExitInfo(context.packageName, 0, maxRecords)
+            val exits = am.getHistoricalProcessExitReasons(context.packageName, 0, maxRecords)
             if (exits.isEmpty()) {
                 return@runCatching "(No historical process exits recorded yet)"
             }
@@ -219,7 +219,7 @@ object DiagLogStore {
             val latestExit = runCatching {
                 val am = context.getSystemService(ActivityManager::class.java)
                 val engineProc = "${context.packageName}:engine"
-                am?.getHistoricalProcessExitInfo(context.packageName, 0, 6)
+                am?.getHistoricalProcessExitReasons(context.packageName, 0, 6)
                     ?.firstOrNull { it.processName == engineProc }
             }.getOrNull()
             if (latestExit != null) {
