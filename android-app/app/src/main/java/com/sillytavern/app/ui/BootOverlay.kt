@@ -96,7 +96,7 @@ fun BootOverlay(
                                 Box(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .height(200.dp)
+                                        .height(240.dp)
                                         .background(Color(0xFF0C0D11), RoundedCornerShape(10.dp))
                                         .padding(10.dp)
                                         .verticalScroll(rememberScrollState()),

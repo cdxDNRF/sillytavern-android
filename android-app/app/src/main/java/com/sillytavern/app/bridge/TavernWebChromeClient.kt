@@ -109,7 +109,12 @@ class TavernWebChromeClient(
         val parentView = view ?: return false
         val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
 
-        val tempWebView = WebView(parentView.context)
+        val tempWebView = try {
+            WebView(parentView.context)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Failed creating popup WebView", t)
+            return false
+        }
         tempWebView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(
                 view: WebView?,

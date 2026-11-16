@@ -10,11 +10,16 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.graphics.Color as AndroidColor
+import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
+import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.URLUtil
@@ -24,6 +29,11 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
@@ -68,6 +78,7 @@ import com.sillytavern.app.bridge.ExportBridge
 import com.sillytavern.app.bridge.ExportItem
 import com.sillytavern.app.bridge.ExportRepository
 import com.sillytavern.app.bridge.TavernWebChromeClient
+import com.sillytavern.app.diag.DiagLogStore
 import com.sillytavern.app.engine.EngineState
 import com.sillytavern.app.engine.ITavernEngine
 import com.sillytavern.app.engine.ITavernEngineCallback
@@ -96,6 +107,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var exportBridge: ExportBridge
     private lateinit var webChromeClient: TavernWebChromeClient
 
+    private var uiSetupFailed = false
     private var engineBinder: ITavernEngine? = null
     private var bindRequested = false
     private var serviceConnected = false
@@ -137,87 +149,96 @@ class MainActivity : ComponentActivity() {
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-            val binder = ITavernEngine.Stub.asInterface(service)
-            if (binder == null) {
-                engineBinder = null
-                serviceConnected = false
-                handleEngineStateUpdate(EngineState.ERROR, 0, "引擎服务返回了空的 Binder 接口。")
-                return
-            }
-            engineBinder = binder
-            serviceConnected = true
-            try {
-                binder.registerCallback(engineCallback)
-                assetVersion = binder.installedAssetVersion ?: ""
-                val state = binder.currentState
-                val port = binder.boundPort
-                val detail = binder.lastError ?: ""
-                handleEngineStateUpdate(state, port, detail)
-                if (state == EngineState.IDLE || state == EngineState.STOPPED) {
-                    binder.startEngine()
+            runOnUiThread {
+                if (!bindRequested) return@runOnUiThread
+                val binder = ITavernEngine.Stub.asInterface(service)
+                if (binder == null) {
+                    unbindEngineSafely()
+                    reportEngineProcessFailure("引擎服务返回了空的 Binder 接口。")
+                    return@runOnUiThread
                 }
-                refreshEngineLogs()
-            } catch (t: Throwable) {
-                Log.e(TAG, "Error querying bound engine service", t)
-                refreshEngineLogs()
-                handleEngineStateUpdate(
-                    EngineState.ERROR,
-                    0,
-                    "连接本地引擎服务失败 (${t.javaClass.simpleName}): ${t.message ?: "未知异常"}",
-                )
+                engineBinder = binder
+                serviceConnected = true
+                DiagLogStore.appendEvent(applicationContext, "MainActivity", "onServiceConnected(:engine)")
+                try {
+                    binder.registerCallback(engineCallback)
+                    assetVersion = binder.installedAssetVersion ?: ""
+                    val state = binder.currentState
+                    val port = binder.boundPort
+                    val detail = binder.lastError ?: ""
+                    handleEngineStateUpdate(state, port, detail)
+                    if (state == EngineState.IDLE || state == EngineState.STOPPED) {
+                        binder.startEngine()
+                    }
+                    refreshEngineLogs()
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Error querying bound engine service", t)
+                    DiagLogStore.appendEvent(
+                        applicationContext,
+                        "MainActivity",
+                        "Binder query failed: ${t.javaClass.simpleName}: ${t.message}",
+                    )
+                    unbindEngineSafely()
+                    reportEngineProcessFailure(
+                        "连接本地引擎服务失败 (${t.javaClass.simpleName}): ${t.message ?: "未知异常"}",
+                    )
+                }
             }
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
-            engineBinder = null
-            serviceConnected = false
-            webViewPageLoaded = false
-            lastLoadedSessionKey = ""
-            if (engineState != EngineState.STOPPED) {
-                refreshEngineLogs()
-                handleEngineStateUpdate(
-                    EngineState.ERROR,
-                    0,
-                    "与本地后台服务的连接已断开 (onServiceDisconnected)，请点击重试启动。",
+            runOnUiThread {
+                if (!bindRequested && !serviceConnected) return@runOnUiThread
+                val wasIntentionalStop = (engineState == EngineState.STOPPED)
+                DiagLogStore.appendEvent(
+                    applicationContext,
+                    "MainActivity",
+                    "onServiceDisconnected(:engine) prevState=$engineState intentional=$wasIntentionalStop",
                 )
+                unbindEngineSafely()
+                webViewPageLoaded = false
+                lastLoadedSessionKey = ""
+                if (!wasIntentionalStop) {
+                    reportEngineProcessFailure("与本地后台服务的连接已断开 (:engine 进程意外终止)。")
+                }
             }
         }
 
         override fun onBindingDied(name: ComponentName?) {
-            engineBinder = null
-            serviceConnected = false
-            webViewPageLoaded = false
-            lastLoadedSessionKey = ""
-            refreshEngineLogs()
-            handleEngineStateUpdate(
-                EngineState.ERROR,
-                0,
-                "本地后台服务连接已失效 (onBindingDied)，请点击重试启动。",
-            )
+            runOnUiThread {
+                if (!bindRequested && !serviceConnected) return@runOnUiThread
+                val wasIntentionalStop = (engineState == EngineState.STOPPED)
+                DiagLogStore.appendEvent(
+                    applicationContext,
+                    "MainActivity",
+                    "onBindingDied(:engine) prevState=$engineState intentional=$wasIntentionalStop",
+                )
+                unbindEngineSafely()
+                webViewPageLoaded = false
+                lastLoadedSessionKey = ""
+                if (!wasIntentionalStop) {
+                    reportEngineProcessFailure("本地后台服务连接已失效 (:engine 进程已退出)。")
+                }
+            }
         }
 
         override fun onNullBinding(name: ComponentName?) {
-            engineBinder = null
-            serviceConnected = false
-            handleEngineStateUpdate(
-                EngineState.ERROR,
-                0,
-                "本地引擎服务返回空绑定 (onNullBinding)。",
-            )
+            runOnUiThread {
+                DiagLogStore.appendEvent(applicationContext, "MainActivity", "onNullBinding(:engine)")
+                unbindEngineSafely()
+                reportEngineProcessFailure("本地引擎服务返回空绑定 (onNullBinding)。")
+            }
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        enableEdgeToEdge(
-            statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
-            navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
-        )
-        super.onCreate(savedInstanceState)
-
-        exportRepository = ExportRepository(applicationContext).apply {
-            cleanupPartialFiles()
+        runCatching {
+            enableEdgeToEdge(
+                statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
+                navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
+            )
         }
-        exportsList = exportRepository.listExports()
+        super.onCreate(savedInstanceState)
 
         openDocumentLauncher = registerForActivityResult(
             ActivityResultContracts.StartActivityForResult(),
@@ -244,47 +265,64 @@ class MainActivity : ComponentActivity() {
             // Foreground service operates cleanly regardless of notification visibility.
         }
 
-        exportBridge = ExportBridge(
-            repository = exportRepository,
-            onExportCompleted = { item ->
-                exportsList = exportRepository.listExports()
-                showSnackWithExportAction("已保存到应用导出箱: ${item.name}")
-            },
-            onExportFailed = { msg ->
-                showSnack(msg)
-            },
-        )
+        try {
+            DiagLogStore.appendEvent(applicationContext, "MainActivity", "onCreate()")
 
-        webChromeClient = TavernWebChromeClient(
-            launchFileChooser = { intent, callback ->
-                pendingFileChooserCallback?.invoke(RESULT_CANCELED, null)
-                pendingFileChooserCallback = callback
-                openDocumentLauncher.launch(intent)
-            },
-            onLocalUrlRequested = { url ->
-                if (isLoopbackUrl(url)) {
-                    webViewRef?.loadUrl(url)
-                }
-            },
-            onExternalUrlRequested = { url ->
-                pendingExternalUrl = url
-            },
-        )
-
-        startAndBindEngineService()
-        startStartupWatchdog()
-
-        setContent {
-            SillyTavernAppTheme {
-                MainScreen()
+            exportRepository = ExportRepository(applicationContext).apply {
+                cleanupPartialFiles()
             }
+            exportsList = exportRepository.listExports()
+
+            exportBridge = ExportBridge(
+                repository = exportRepository,
+                onExportCompleted = { item ->
+                    exportsList = exportRepository.listExports()
+                    showSnackWithExportAction("已保存到应用导出箱: ${item.name}")
+                },
+                onExportFailed = { msg ->
+                    showSnack(msg)
+                },
+            )
+
+            webChromeClient = TavernWebChromeClient(
+                launchFileChooser = { intent, callback ->
+                    pendingFileChooserCallback?.invoke(RESULT_CANCELED, null)
+                    pendingFileChooserCallback = callback
+                    openDocumentLauncher.launch(intent)
+                },
+                onLocalUrlRequested = { url ->
+                    if (isLoopbackUrl(url)) {
+                        webViewRef?.loadUrl(url)
+                    }
+                },
+                onExternalUrlRequested = { url ->
+                    pendingExternalUrl = url
+                },
+            )
+
+            startAndBindEngineService()
+            startStartupWatchdog()
+
+            setContent {
+                SillyTavernAppTheme {
+                    MainScreen()
+                }
+            }
+        } catch (t: Throwable) {
+            uiSetupFailed = true
+            Log.e(TAG, "Fatal error in MainActivity.onCreate", t)
+            DiagLogStore.recordJavaCrash(applicationContext, Thread.currentThread(), t)
+            showNativeFallbackErrorView(t)
         }
     }
 
     override fun onStart() {
         super.onStart()
-        exportsList = exportRepository.listExports()
-        if (!bindRequested) {
+        if (uiSetupFailed) return
+        if (::exportRepository.isInitialized) {
+            exportsList = exportRepository.listExports()
+        }
+        if (!bindRequested && engineState != EngineState.ERROR && engineState != EngineState.STOPPED) {
             startAndBindEngineService()
             startStartupWatchdog()
         }
@@ -302,21 +340,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         startupWatchdogJob?.cancel()
-        webChromeClient.cancelPendingFileChooser()
-        exportBridge.releaseAll()
-        if (bindRequested) {
-            try {
-                engineBinder?.unregisterCallback(engineCallback)
-            } catch (_: Exception) {
-            }
-            try {
-                unbindService(serviceConnection)
-            } catch (_: Exception) {
-            }
-            bindRequested = false
-            serviceConnected = false
-            engineBinder = null
+        if (::webChromeClient.isInitialized) {
+            webChromeClient.cancelPendingFileChooser()
         }
+        if (::exportBridge.isInitialized) {
+            exportBridge.releaseAll()
+        }
+        unbindEngineSafely()
         webViewRef?.let { wv ->
             wv.stopLoading()
             wv.removeJavascriptInterface("STAndroidBridge")
@@ -324,6 +354,76 @@ class MainActivity : ComponentActivity() {
         }
         webViewRef = null
         super.onDestroy()
+    }
+
+    private fun showNativeFallbackErrorView(throwable: Throwable) {
+        val report = runCatching {
+            DiagLogStore.readCombinedDiagnostics(applicationContext, throwable.stackTraceToString())
+        }.getOrElse {
+            "${throwable.javaClass.name}: ${throwable.message}\n${throwable.stackTraceToString()}"
+        }
+
+        val dp = resources.displayMetrics.density
+        val pad = (16 * dp).toInt()
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(AndroidColor.parseColor("#121318"))
+            setPadding(pad, (42 * dp).toInt(), pad, pad)
+        }
+
+        val title = TextView(this).apply {
+            text = "SillyTavern 界面初始化异常"
+            setTextColor(AndroidColor.parseColor("#FF6B6B"))
+            textSize = 18f
+            setTypeface(typeface, Typeface.BOLD)
+        }
+        val subtitle = TextView(this).apply {
+            text = "${throwable.javaClass.simpleName}: ${throwable.message ?: "未知异常"}\n请点击「复制完整日志」发送排查。"
+            setTextColor(AndroidColor.parseColor("#ECEEF4"))
+            textSize = 13f
+            setPadding(0, (8 * dp).toInt(), 0, (12 * dp).toInt())
+        }
+
+        val scroll = ScrollView(this).apply {
+            setBackgroundColor(AndroidColor.parseColor("#0C0D11"))
+            setPadding((10 * dp).toInt(), (10 * dp).toInt(), (10 * dp).toInt(), (10 * dp).toInt())
+        }
+        val logView = TextView(this).apply {
+            text = report
+            setTextColor(AndroidColor.parseColor("#D6DCE8"))
+            typeface = Typeface.MONOSPACE
+            textSize = 11f
+            setTextIsSelectable(true)
+        }
+        scroll.addView(logView)
+
+        val btnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(0, (12 * dp).toInt(), 0, 0)
+        }
+        val copyBtn = Button(this).apply {
+            text = "复制完整日志"
+            setOnClickListener {
+                runCatching {
+                    val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    cm.setPrimaryClip(ClipData.newPlainText("SillyTavern UI Crash", report))
+                    Toast.makeText(this@MainActivity, "已复制诊断日志", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        val exitBtn = Button(this).apply {
+            text = "关闭退出"
+            setOnClickListener { finishAndRemoveTask() }
+        }
+        btnRow.addView(copyBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        btnRow.addView(exitBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+        root.addView(title)
+        root.addView(subtitle)
+        root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        root.addView(btnRow)
+        setContentView(root)
     }
 
     @Composable
@@ -346,7 +446,7 @@ class MainActivity : ComponentActivity() {
         ) {
             if (engineState == EngineState.READY || webViewRef != null) {
                 AndroidView(
-                    factory = { ctx -> createConfiguredWebView(ctx) },
+                    factory = { ctx -> safeCreateWebView(ctx) },
                     modifier = Modifier.fillMaxSize(),
                 )
             }
@@ -492,6 +592,26 @@ class MainActivity : ComponentActivity() {
                     }
                 },
             )
+        }
+    }
+
+    private fun safeCreateWebView(context: Context): View {
+        return try {
+            createConfiguredWebView(context)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Failed to initialize Android WebView", t)
+            DiagLogStore.recordJavaCrash(applicationContext, Thread.currentThread(), t)
+            Handler(Looper.getMainLooper()).post {
+                refreshEngineLogs()
+                handleEngineStateUpdate(
+                    EngineState.ERROR,
+                    enginePort,
+                    "系统 WebView 组件初始化失败 (${t.javaClass.simpleName}): ${t.message ?: "请检查或更新 Android System WebView"}",
+                )
+            }
+            View(context).apply {
+                setBackgroundColor(AndroidColor.parseColor("#121318"))
+            }
         }
     }
 
@@ -841,20 +961,21 @@ class MainActivity : ComponentActivity() {
                 if (engineState == EngineState.IDLE) {
                     idleSeconds += 1
                     if (idleSeconds >= 8) {
-                        refreshEngineLogs()
-                        handleEngineStateUpdate(
-                            EngineState.ERROR,
-                            0,
-                            "连接本地后台服务超时（8 秒未收到引擎状态）。\n" +
-                                "服务状态: bindRequested=$bindRequested, connected=$serviceConnected。\n" +
-                                "请点击下方「复制日志」或「重试启动」。",
+                        DiagLogStore.appendEvent(
+                            applicationContext,
+                            "Watchdog",
+                            "IDLE timeout after 8s (bindRequested=$bindRequested, connected=$serviceConnected)",
+                        )
+                        unbindEngineSafely()
+                        reportEngineProcessFailure(
+                            "连接本地后台服务超时（8 秒未收到引擎状态，bindRequested=$bindRequested, connected=$serviceConnected）。",
                         )
                         break
                     }
                 } else {
                     idleSeconds = 0
                 }
-                if (showDiagnosticsDialog || bootElapsedSeconds % 3 == 0) {
+                if (showDiagnosticsDialog || bootElapsedSeconds % 2 == 0) {
                     refreshEngineLogs()
                 }
             }
@@ -870,44 +991,59 @@ class MainActivity : ComponentActivity() {
                 ContextCompat.startForegroundService(this, intent)
             } catch (t: Throwable) {
                 Log.e(TAG, "Failed to start TavernEngineService", t)
-                handleEngineStateUpdate(
-                    EngineState.ERROR,
-                    0,
+                DiagLogStore.appendEvent(
+                    applicationContext,
+                    "MainActivity",
+                    "startForegroundService failed: ${t.javaClass.simpleName}: ${t.message}",
+                )
+                reportEngineProcessFailure(
                     "无法启动本地后台服务 (${t.javaClass.simpleName}): ${t.message ?: "请检查应用权限"}",
                 )
             }
         } catch (t: Throwable) {
             Log.e(TAG, "Failed to start TavernEngineService", t)
-            handleEngineStateUpdate(
-                EngineState.ERROR,
-                0,
+            DiagLogStore.appendEvent(
+                applicationContext,
+                "MainActivity",
+                "startService failed: ${t.javaClass.simpleName}: ${t.message}",
+            )
+            reportEngineProcessFailure(
                 "无法启动本地后台服务 (${t.javaClass.simpleName}): ${t.message}",
             )
         }
     }
 
     private fun startAndBindEngineService() {
-        bindEngineService()
-        val startIntent = Intent(this, TavernEngineService::class.java).apply {
-            action = TavernEngineService.ACTION_START
+        val boundOk = bindEngineService()
+        if (boundOk) {
+            val startIntent = Intent(this, TavernEngineService::class.java).apply {
+                action = TavernEngineService.ACTION_START
+            }
+            startEngineServiceIntent(startIntent)
         }
-        startEngineServiceIntent(startIntent)
+    }
+
+    private fun unbindEngineSafely() {
+        val binder = engineBinder
+        if (binder != null) {
+            try {
+                binder.unregisterCallback(engineCallback)
+            } catch (_: Throwable) {
+            }
+        }
+        if (bindRequested) {
+            try {
+                unbindService(serviceConnection)
+            } catch (_: Throwable) {
+            }
+        }
+        bindRequested = false
+        serviceConnected = false
+        engineBinder = null
     }
 
     private fun rebindEngineServiceConnection() {
-        if (bindRequested) {
-            try {
-                engineBinder?.unregisterCallback(engineCallback)
-            } catch (_: Exception) {
-            }
-            try {
-                unbindService(serviceConnection)
-            } catch (_: Exception) {
-            }
-            bindRequested = false
-            engineBinder = null
-            serviceConnected = false
-        }
+        unbindEngineSafely()
         bindEngineService()
     }
 
@@ -918,21 +1054,57 @@ class MainActivity : ComponentActivity() {
             val ok = bindService(bindIntent, serviceConnection, Context.BIND_AUTO_CREATE)
             bindRequested = ok
             if (!ok) {
-                handleEngineStateUpdate(
-                    EngineState.ERROR,
-                    0,
+                DiagLogStore.appendEvent(applicationContext, "MainActivity", "bindService returned false")
+                reportEngineProcessFailure(
                     "系统拒绝绑定本地引擎服务 (bindService=false)，请检查应用权限后重试。",
                 )
             }
             ok
         } catch (t: Throwable) {
             Log.e(TAG, "bindService failed", t)
-            handleEngineStateUpdate(
-                EngineState.ERROR,
-                0,
+            DiagLogStore.appendEvent(
+                applicationContext,
+                "MainActivity",
+                "bindService threw ${t.javaClass.simpleName}: ${t.message}",
+            )
+            reportEngineProcessFailure(
                 "绑定本地引擎服务失败 (${t.javaClass.simpleName}): ${t.message}",
             )
             false
+        }
+    }
+
+    private fun reportEngineProcessFailure(fallbackReason: String) {
+        lifecycleScope.launch {
+            val liveLogs = withContext(Dispatchers.IO) { fetchLiveBinderLogs() }
+            val (headline, fullDiag) = withContext(Dispatchers.IO) {
+                val h = DiagLogStore.extractEngineCrashHeadline(applicationContext)
+                val d = formatDiagnosticSnapshot(liveLogs)
+                h to d
+            }
+            logsText = fullDiag
+            val detailMessage = if (headline.isNotBlank()) {
+                "$fallbackReason\n定位摘要: $headline\n请点击下方「复制日志」或「重试启动」。"
+            } else {
+                "$fallbackReason\n请点击下方「复制日志」或「重试启动」。"
+            }
+            handleEngineStateUpdate(EngineState.ERROR, 0, detailMessage)
+
+            // ActivityManager sometimes finalizes ApplicationExitInfo 200-400ms after process death.
+            delay(450L)
+            if (engineState == EngineState.ERROR) {
+                val (lateHeadline, lateDiag) = withContext(Dispatchers.IO) {
+                    val h = DiagLogStore.extractEngineCrashHeadline(applicationContext)
+                    val d = formatDiagnosticSnapshot("")
+                    h to d
+                }
+                if (lateDiag.length >= logsText.length || lateDiag != logsText) {
+                    logsText = lateDiag
+                }
+                if (lateHeadline.isNotBlank() && headline.isBlank()) {
+                    engineDetail = "$fallbackReason\n定位摘要: $lateHeadline\n请点击下方「复制日志」或「重试启动」。"
+                }
+            }
         }
     }
 
@@ -940,6 +1112,9 @@ class MainActivity : ComponentActivity() {
         lastLoadedSessionKey = ""
         webViewPageLoaded = false
         logsText = ""
+        engineDetail = "正在重新连接本地引擎服务..."
+        engineState = EngineState.IDLE
+        DiagLogStore.appendEvent(applicationContext, "MainActivity", "User tapped retryEngineStart")
         val binder = engineBinder
         if (binder != null) {
             try {
@@ -948,17 +1123,17 @@ class MainActivity : ComponentActivity() {
                     binder.startEngine()
                 } else {
                     restartEngineFromUi()
+                    return
                 }
                 startStartupWatchdog()
                 return
             } catch (_: Exception) {
+                unbindEngineSafely()
             }
+        } else {
+            unbindEngineSafely()
         }
-        rebindEngineServiceConnection()
-        val startIntent = Intent(this, TavernEngineService::class.java).apply {
-            action = TavernEngineService.ACTION_START
-        }
-        startEngineServiceIntent(startIntent)
+        startAndBindEngineService()
         startStartupWatchdog()
     }
 
@@ -966,6 +1141,9 @@ class MainActivity : ComponentActivity() {
         lastLoadedSessionKey = ""
         webViewPageLoaded = false
         logsText = ""
+        engineDetail = "正在重启本地引擎..."
+        engineState = EngineState.STARTING
+        DiagLogStore.appendEvent(applicationContext, "MainActivity", "User triggered restartEngineFromUi")
         if (!bindRequested || engineBinder == null) {
             rebindEngineServiceConnection()
         }
@@ -982,6 +1160,7 @@ class MainActivity : ComponentActivity() {
             engineBinder?.stopEngine()
         } catch (_: Exception) {
         }
+        unbindEngineSafely()
         val stopIntent = Intent(this, TavernEngineService::class.java).apply {
             action = TavernEngineService.ACTION_STOP
         }
@@ -989,35 +1168,53 @@ class MainActivity : ComponentActivity() {
         finishAndRemoveTask()
     }
 
-    private fun refreshEngineLogs() {
-        val binder = engineBinder
-        if (binder == null) {
-            if (logsText.isBlank()) {
-                logsText = buildString {
-                    append("[MainActivity] binder=null, bindRequested=$bindRequested, connected=$serviceConnected, state=$engineState\n")
-                    if (engineDetail.isNotBlank()) {
-                        append("[MainActivity] detail=$engineDetail\n")
-                    }
-                }
-            }
-            return
-        }
-        try {
-            val fetched = binder.recentLogs
-            if (!fetched.isNullOrBlank()) {
-                logsText = fetched
-            }
+    private fun fetchLiveBinderLogs(): String {
+        val binder = engineBinder ?: return ""
+        return try {
+            binder.recentLogs.orEmpty()
         } catch (t: Throwable) {
-            logsText = "获取日志失败: ${t.message}"
+            "[MainActivity] failed reading binder logs: ${t.javaClass.simpleName}: ${t.message}"
+        }
+    }
+
+    private fun formatDiagnosticSnapshot(liveLogs: String): String {
+        val diskReport = DiagLogStore.readCombinedDiagnostics(applicationContext, liveLogs)
+        return buildString {
+            append(diskReport)
+            append("\n--- MainActivity State ---\n")
+            append("bindRequested=$bindRequested connected=$serviceConnected engineState=$engineState port=$enginePort\n")
+            if (engineDetail.isNotBlank()) {
+                append("detail=$engineDetail\n")
+            }
+        }
+    }
+
+    private fun refreshEngineLogs() {
+        lifecycleScope.launch {
+            val snapshot = withContext(Dispatchers.IO) {
+                val liveLogs = fetchLiveBinderLogs()
+                formatDiagnosticSnapshot(liveLogs)
+            }
+            if (snapshot.isNotBlank()) {
+                logsText = snapshot
+            }
         }
     }
 
     private fun copyLogsToClipboard() {
-        refreshEngineLogs()
-        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        val content = logsText.ifBlank { engineDetail.ifBlank { "No engine logs captured." } }
-        cm.setPrimaryClip(ClipData.newPlainText("SillyTavern Engine Logs", content))
-        showSnack("已复制引擎日志到剪贴板")
+        lifecycleScope.launch {
+            val snapshot = withContext(Dispatchers.IO) {
+                val liveLogs = fetchLiveBinderLogs()
+                formatDiagnosticSnapshot(liveLogs)
+            }
+            logsText = snapshot
+            val content = snapshot.ifBlank { engineDetail.ifBlank { "No engine logs captured." } }
+            runCatching {
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("SillyTavern Engine Logs", content))
+            }
+            showSnack("已复制完整诊断日志到剪贴板")
+        }
     }
 
     private fun requestNotificationPermissionIfNeeded() {

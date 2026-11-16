@@ -13,11 +13,13 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.Process
 import android.os.RemoteCallbackList
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.sillytavern.app.MainActivity
 import com.sillytavern.app.R
+import com.sillytavern.app.diag.DiagLogStore
 import java.security.SecureRandom
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -27,6 +29,7 @@ class TavernEngineService : Service() {
         private const val TAG = "TavernEngineService"
         private const val CHANNEL_ID = "sillytavern_engine_channel"
         private const val NOTIF_ID = 1001
+        private const val MAX_IPC_LOG_CHARS = 48 * 1024
 
         const val ACTION_START = "com.sillytavern.app.action.START_ENGINE"
         const val ACTION_RESTART = "com.sillytavern.app.action.RESTART_ENGINE"
@@ -83,10 +86,12 @@ class TavernEngineService : Service() {
         }
 
         override fun startEngine() {
+            appendServiceLog("Binder.startEngine() called (currentState=$currentState)")
             ensureEngineStarted()
         }
 
         override fun stopEngine() {
+            appendServiceLog("Binder.stopEngine() called")
             restartPending.set(false)
             shutdownEngine(stopSelfAfter = true)
         }
@@ -105,7 +110,7 @@ class TavernEngineService : Service() {
             val kotlinLogs = synchronized(serviceLogLock) {
                 serviceLogs.joinToString("\n")
             }
-            val nativeLogs = if (nativeLibraryLoaded.get()) {
+            val nativeLogs = if (nativeLibraryLoaded.get() && NativeNodeEngine.isLoaded()) {
                 try {
                     NativeNodeEngine.nativeGetRecentLogs()
                 } catch (t: Throwable) {
@@ -114,7 +119,7 @@ class TavernEngineService : Service() {
             } else {
                 ""
             }
-            return buildString {
+            val combined = buildString {
                 if (kotlinLogs.isNotBlank()) {
                     append(kotlinLogs)
                 }
@@ -123,6 +128,11 @@ class TavernEngineService : Service() {
                     append(nativeLogs)
                 }
             }
+            return if (combined.length > MAX_IPC_LOG_CHARS) {
+                combined.takeLast(MAX_IPC_LOG_CHARS)
+            } else {
+                combined
+            }
         }
 
         override fun getInstalledAssetVersion(): String = installedAssetVersion
@@ -130,7 +140,7 @@ class TavernEngineService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        appendServiceLog("TavernEngineService.onCreate (pid=${android.os.Process.myPid()})")
+        appendServiceLog("TavernEngineService.onCreate (pid=${Process.myPid()})")
         runCatching { createNotificationChannel() }
             .onFailure { appendServiceLog("createNotificationChannel warning: ${it.message}") }
         installedAssetVersion = runCatching { AssetExtractor.readInstalledSha(this) }.getOrDefault("")
@@ -138,22 +148,22 @@ class TavernEngineService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
-        appendServiceLog("onStartCommand action=${action ?: "<null>"}")
-        when (action) {
+        appendServiceLog("onStartCommand action=${action ?: "<null>"} startId=$startId")
+        return when (action) {
             ACTION_STOP -> {
                 restartPending.set(false)
                 shutdownEngine(stopSelfAfter = true)
-                return START_NOT_STICKY
+                START_NOT_STICKY
             }
             ACTION_RESTART -> {
                 promoteForeground("正在重启本地 SillyTavern 引擎...")
                 requestRestart()
-                return START_NOT_STICKY
+                START_NOT_STICKY
             }
             else -> {
                 promoteForeground("正在启动本地 SillyTavern 引擎...")
                 ensureEngineStarted()
-                return START_NOT_STICKY
+                START_NOT_STICKY
             }
         }
     }
@@ -181,6 +191,7 @@ class TavernEngineService : Service() {
                 serviceLogs.removeFirst()
             }
         }
+        DiagLogStore.appendEvent(applicationContext, "Service", msg)
     }
 
     private fun generateSessionToken(): String {
@@ -326,6 +337,8 @@ class TavernEngineService : Service() {
             boundPort = 0
             boundUrl = ""
             lastError = ""
+            DiagLogStore.archiveEngineArtifactsForFreshRun(applicationContext)
+            appendServiceLog("=== Fresh Engine Start Attempt ===")
             publishState(EngineState.EXTRACTING, 0, "", "正在检查并准备本地运行环境...")
             promoteForeground("正在准备 SillyTavern 运行环境...")
             acquirePowerLocks()
@@ -335,6 +348,7 @@ class TavernEngineService : Service() {
                 try {
                     appendServiceLog("Ensuring SillyTavern assets prepared in app filesDir...")
                     val prepared = AssetExtractor.ensurePrepared(applicationContext) { progress ->
+                        appendServiceLog("Extract progress: $progress")
                         publishState(EngineState.EXTRACTING, 0, "", progress)
                         updateNotification(progress)
                     }
@@ -344,11 +358,18 @@ class TavernEngineService : Service() {
                     publishState(EngineState.STARTING, 0, "", "正在加载嵌入式 Node.js 运行时...")
                     updateNotification("正在启动本地 SillyTavern 服务...")
 
-                    val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-                    appendServiceLog("Loading libnode.so + libst_bridge.so...")
-                    val dnsOk = NativeNodeEngine.nativeInitDns(cm)
+                    NativeNodeEngine.ensureLoaded { step ->
+                        appendServiceLog(step)
+                    }
+                    val diagPath = DiagLogStore.diagDir(applicationContext).absolutePath
+                    appendServiceLog("Configuring native diagDir=$diagPath")
+                    NativeNodeEngine.nativeSetDiagDir(diagPath)
                     nativeLibraryLoaded.set(true)
-                    appendServiceLog("Native runtime loaded (dnsInit=$dnsOk), launching Node event loop...")
+
+                    val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                    appendServiceLog("Initializing Android DNS hook for c-ares...")
+                    val dnsOk = NativeNodeEngine.nativeInitDns(cm)
+                    appendServiceLog("Native runtime ready (dnsInit=$dnsOk), launching Node event loop...")
 
                     publishState(EngineState.STARTING, 0, "", "正在启动嵌入式 Node.js 服务...")
                     val exitCode = NativeNodeEngine.nativeStartNode(
@@ -375,8 +396,13 @@ class TavernEngineService : Service() {
 
                     appendServiceLog("Node event loop exited with code=$exitCode (state=$currentState)")
                     if (currentState != EngineState.STOPPED && currentState != EngineState.ERROR) {
-                        if (exitCode != 0) {
-                            publishState(EngineState.ERROR, 0, "", "Node.js 引擎意外退出 (exitCode=$exitCode)")
+                        if (currentState != EngineState.READY || exitCode != 0) {
+                            publishState(
+                                EngineState.ERROR,
+                                0,
+                                "",
+                                "Node.js 引擎在就绪前意外退出 (exitCode=$exitCode, state=$currentState)",
+                            )
                         } else {
                             publishState(EngineState.STOPPED, 0, "", "")
                         }
@@ -384,6 +410,7 @@ class TavernEngineService : Service() {
                 } catch (t: Throwable) {
                     appendServiceLog("Failed inside engine thread: ${t.javaClass.name}: ${t.message}")
                     Log.e(TAG, "Failed inside engine thread", t)
+                    DiagLogStore.recordJavaCrash(applicationContext, Thread.currentThread(), t)
                     publishState(EngineState.ERROR, 0, "", t.stackTraceToString())
                 } finally {
                     engineStartingOrRunning.set(false)
@@ -396,6 +423,7 @@ class TavernEngineService : Service() {
             }
         } catch (t: Throwable) {
             appendServiceLog("Failed scheduling engine start: ${t.javaClass.name}: ${t.message}")
+            DiagLogStore.recordJavaCrash(applicationContext, Thread.currentThread(), t)
             engineStartingOrRunning.set(false)
             releasePowerLocks()
             publishState(EngineState.ERROR, 0, "", t.stackTraceToString())
@@ -405,7 +433,7 @@ class TavernEngineService : Service() {
     private fun requestRestart() {
         restartPending.set(true)
         publishState(EngineState.STARTING, 0, "", "正在重启本地引擎...")
-        if (engineStartingOrRunning.get() && nativeLibraryLoaded.get()) {
+        if (engineStartingOrRunning.get() && nativeLibraryLoaded.get() && NativeNodeEngine.isLoaded()) {
             try {
                 NativeNodeEngine.nativeStopNode()
             } catch (t: Throwable) {
@@ -420,7 +448,7 @@ class TavernEngineService : Service() {
 
     private fun shutdownEngine(stopSelfAfter: Boolean) {
         publishState(EngineState.STOPPED, 0, "", "")
-        if (nativeLibraryLoaded.get()) {
+        if (nativeLibraryLoaded.get() && NativeNodeEngine.isLoaded()) {
             try {
                 NativeNodeEngine.nativeStopNode()
             } catch (t: Throwable) {
